@@ -18,6 +18,7 @@
 
 #include <WiFi.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
 #include <math.h>
@@ -26,17 +27,23 @@
 #define ECHO_PIN 18
 #define RELAY_PIN 25
 
-/* ================= WIFI CREDENTIALS (DUAL NETWORK SUPPORT) ================= */
+/* ================= WIFI CREDENTIALS & HOTSPOT SETUP ================= */
 
 const char* AP_SSID = "ESP32_Water_Setup";
 const char* AP_PASS = "12345678";
 
-// Primary & Secondary Wi-Fi Networks
-const char* WIFI_SSID_1 = "IoT Lab";
-const char* WIFI_PASS_1 = "iot@diu123";
+// User Wi-Fi Credentials (Primary: WIFI / RAHAT)
+const char* DEFAULT_WIFI_SSID = "WIFI";
+const char* DEFAULT_WIFI_PASS = "RAHAT";
 
-const char* WIFI_SSID_2 = "WIFI";
-const char* WIFI_PASS_2 = "RAHAT1234";
+// Secondary Fallback Network
+const char* FALLBACK_WIFI_SSID = "IoT Lab";
+const char* FALLBACK_WIFI_PASS = "iot@diu123";
+
+// User-Configured Wi-Fi loaded from Preferences
+String configuredSSID = "";
+String configuredPASS = "";
+
 
 /* ================= MQTT CREDENTIALS & TOPICS ================= */
 
@@ -52,6 +59,7 @@ const char* TOPIC_COMMAND   = "devices/ESP32_WATER_01/command";
 WiFiClient espClient;
 PubSubClient mqtt(espClient);
 
+DNSServer dnsServer;
 WebServer server(80);
 Preferences prefs;
 
@@ -227,6 +235,17 @@ void loadSettings() {
 }
 
 /* =====================================================
+   LOAD WIFI SETTINGS
+   ===================================================== */
+
+void loadWiFiSettings() {
+  prefs.begin("wifi_cfg", true);
+  configuredSSID = prefs.getString("ssid", "");
+  configuredPASS = prefs.getString("pass", "");
+  prefs.end();
+}
+
+/* =====================================================
    RESET ALL (ORIGINAL ALGO)
    ===================================================== */
 
@@ -242,6 +261,12 @@ void resetAll() {
   prefs.begin("water", false);
   prefs.clear();
   prefs.end();
+
+  prefs.begin("wifi_cfg", false);
+  prefs.clear();
+  prefs.end();
+  configuredSSID = "";
+  configuredPASS = "";
 
   tankRadius = 50;
   tankHeight = 100;
@@ -899,7 +924,10 @@ String buildTelemetryJSON() {
   json += "\"system_state\":\"" + state + "\",";
   json += "\"remaining\":" + String(remaining) + ",";
   json += "\"calType\":\"" + calibrationType + "\",";
-  json += "\"progress\":" + String(progress, 1);
+  json += "\"progress\":" + String(progress, 1) + ",";
+  json += "\"wifi_connected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  json += "\"wifi_ssid\":\"" + String(WiFi.status() == WL_CONNECTED ? WiFi.SSID() : "") + "\",";
+  json += "\"wifi_ip\":\"" + String(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "") + "\"";
   json += "}";
 
   return json;
@@ -1206,6 +1234,232 @@ void resetAllAPI() {
 }
 
 /* =====================================================
+   WIFI MANAGER WEB PORTAL & CAPTIVE PORTAL
+   ===================================================== */
+
+void handleCaptiveRedirect() {
+  server.sendHeader("Location", "http://192.168.4.1/wifi", true);
+  server.send(302, "text/plain", "");
+}
+
+void handleWifiPage() {
+  int n = WiFi.scanNetworks();
+  String html = "<!DOCTYPE html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">";
+  html += "<title>ESP32 Wi-Fi Setup</title>";
+  html += "<style>";
+  html += "*{box-sizing:border-box;}";
+  html += "body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#f8fafc;padding:16px;}";
+  html += ".card{max-width:440px;margin:10px auto;background:#1e293b;padding:24px;border-radius:18px;box-shadow:0 10px 25px rgba(0,0,0,0.5);border:1px solid #334155;}";
+  html += "h2{margin:0 0 6px 0;font-size:22px;color:#38bdf8;}";
+  html += "p{color:#94a3b8;font-size:14px;margin:0 0 16px 0;}";
+  html += ".status{padding:12px;border-radius:10px;margin-bottom:16px;font-size:13px;font-weight:600;}";
+  html += ".online{background:rgba(34,197,94,0.15);color:#4ade80;border:1px solid rgba(34,197,94,0.3);}";
+  html += ".offline{background:rgba(239,68,68,0.15);color:#f87171;border:1px solid rgba(239,68,68,0.3);}";
+  html += ".net-list{margin-bottom:18px;max-height:200px;overflow-y:auto;border:1px solid #334155;border-radius:12px;padding:4px;background:#0f172a;}";
+  html += ".net-item{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;border-radius:8px;cursor:pointer;border-bottom:1px solid #1e293b;}";
+  html += ".net-item:hover{background:#334155;}";
+  html += ".net-name{font-weight:600;font-size:14px;color:#f1f5f9;}";
+  html += ".net-meta{font-size:12px;color:#94a3b8;}";
+  html += "label{display:block;font-size:12px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;}";
+  html += "input{width:100%;padding:12px 14px;border:1px solid #475569;border-radius:10px;background:#0f172a;color:white;font-size:15px;margin-bottom:14px;outline:none;}";
+  html += "input:focus{border-color:#38bdf8;}";
+  html += ".btn{width:100%;background:#0284c7;color:white;border:0;padding:14px;border-radius:12px;font-size:15px;font-weight:700;cursor:pointer;}";
+  html += ".btn:hover{background:#0369a1;}";
+  html += ".dash-btn{display:block;text-align:center;margin-top:14px;color:#38bdf8;text-decoration:none;font-size:14px;font-weight:600;}";
+  html += "</style>";
+  html += "<script>";
+  html += "function sel(ssid){document.getElementById('ssid').value=ssid;document.getElementById('pass').focus();}";
+  html += "</script>";
+  html += "</head><body><div class=\"card\">";
+  html += "<h2>📶 Wi-Fi Setup</h2>";
+  html += "<p>Select your Wi-Fi network below or enter manually.</p>";
+
+  if (WiFi.status() == WL_CONNECTED) {
+    html += "<div class=\"status online\">✓ Connected to <b>" + WiFi.SSID() + "</b><br>IP: " + WiFi.localIP().toString() + "</div>";
+  } else {
+    html += "<div class=\"status offline\">⚠ Disconnected — Hotspot Mode Active<br>Hotspot: <b>" + String(AP_SSID) + "</b></div>";
+  }
+
+  html += "<label>Discovered Networks (" + String(n > 0 ? n : 0) + ")</label>";
+  html += "<div class=\"net-list\">";
+  if (n <= 0) {
+    html += "<div style=\"padding:12px;color:#94a3b8;text-align:center;\">No networks found. Try refreshing.</div>";
+  } else {
+    for (int i = 0; i < n; ++i) {
+      String s = WiFi.SSID(i);
+      if (s.length() == 0) continue;
+      int r = WiFi.RSSI(i);
+      int pct = constrain(2 * (r + 100), 0, 100);
+      bool enc = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
+      html += "<div class=\"net-item\" onclick=\"sel('" + s + "')\">";
+      html += "<span class=\"net-name\">" + s + "</span>";
+      html += "<span class=\"net-meta\">" + String(pct) + "% " + (enc ? "🔒" : "🔓") + "</span>";
+      html += "</div>";
+    }
+  }
+  html += "</div>";
+
+  String defSSID = configuredSSID != "" ? configuredSSID : String(DEFAULT_WIFI_SSID);
+  html += "<form method=\"POST\" action=\"/wifisave\">";
+  html += "<label for=\"ssid\">Network Name (SSID)</label>";
+  html += "<input type=\"text\" id=\"ssid\" name=\"ssid\" placeholder=\"e.g. MyWiFi\" value=\"" + defSSID + "\" required>";
+  html += "<label for=\"pass\">Wi-Fi Password</label>";
+  html += "<input type=\"password\" id=\"pass\" name=\"pass\" placeholder=\"Enter password\">";
+  html += "<button type=\"submit\" class=\"btn\">Save & Connect</button>";
+  html += "</form>";
+  html += "<a href=\"/\" class=\"dash-btn\">← Tank Controller Dashboard</a>";
+  html += "</div></body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+void handleWifiSave() {
+  String newSSID = server.arg("ssid");
+  String newPASS = server.arg("pass");
+  newSSID.trim();
+  newPASS.trim();
+
+  if (newSSID.length() == 0) {
+    server.send(400, "text/plain", "SSID cannot be empty");
+    return;
+  }
+
+  // Persist to Preferences
+  prefs.begin("wifi_cfg", false);
+  prefs.putString("ssid", newSSID);
+  prefs.putString("pass", newPASS);
+  prefs.end();
+
+  configuredSSID = newSSID;
+  configuredPASS = newPASS;
+
+  String html = "<!DOCTYPE html><html><head><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">";
+  html += "<meta http-equiv=\"refresh\" content=\"10; url=/wifi\">";
+  html += "<title>Connecting...</title>";
+  html += "<style>body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#f8fafc;padding:30px;text-align:center;}";
+  html += ".card{max-width:400px;margin:auto;background:#1e293b;padding:30px;border-radius:18px;border:1px solid #334155;}";
+  html += ".spinner{border:4px solid #334155;border-top:4px solid #38bdf8;border-radius:50%;width:44px;height:44px;animation:spin 1s linear infinite;margin:20px auto;}";
+  html += "@keyframes spin{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}";
+  html += "a{display:inline-block;margin-top:16px;color:#38bdf8;text-decoration:none;font-weight:600;}";
+  html += "</style></head><body><div class=\"card\">";
+  html += "<h2 style=\"color:#38bdf8;margin-top:0;\">Connecting to Wi-Fi</h2>";
+  html += "<p>Applying credentials for <b>" + newSSID + "</b>...</p>";
+  html += "<div class=\"spinner\"></div>";
+  html += "<p style=\"color:#94a3b8;font-size:13px;\">Please wait ~10 seconds. If successful, ESP32 will connect and reach the MQTT broker.</p>";
+  html += "<a href=\"/wifi\">← Back to Setup</a>";
+  html += "</div></body></html>";
+
+  server.send(200, "text/html", html);
+
+  Serial.println();
+  Serial.print(">>> Saving and connecting to Wi-Fi: ");
+  Serial.println(newSSID);
+
+  WiFi.disconnect();
+  delay(300);
+  WiFi.begin(newSSID.c_str(), newPASS.c_str());
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
+    delay(400);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.print(">>> Successfully connected to: ");
+    Serial.println(newSSID);
+    Serial.print(">>> IP Address: ");
+    Serial.println(WiFi.localIP());
+    publishTelemetry();
+  } else {
+    Serial.println();
+    Serial.println(">>> Connection failed or timed out. AP hotspot remains active.");
+  }
+}
+
+/* =====================================================
+   WIFI CONNECTION ROUTINE (MULTI-NETWORK + PREFERENCES)
+   ===================================================== */
+
+void attemptWiFiConnection() {
+  bool connected = false;
+
+  // 1. Try user-configured Wi-Fi if available
+  if (configuredSSID.length() > 0) {
+    Serial.print("Connecting to Configured Wi-Fi: ");
+    Serial.print(configuredSSID);
+    Serial.print(" ... ");
+    WiFi.disconnect();
+    delay(200);
+    WiFi.begin(configuredSSID.c_str(), configuredPASS.c_str());
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 8000) {
+      delay(400);
+      Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      connected = true;
+    }
+    Serial.println();
+  }
+
+  // 2. Try Primary Wi-Fi (WIFI / RAHAT)
+  if (!connected) {
+    Serial.print("Connecting to Primary Wi-Fi (");
+    Serial.print(DEFAULT_WIFI_SSID);
+    Serial.print(") ... ");
+    WiFi.disconnect();
+    delay(200);
+    WiFi.begin(DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS);
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 8000) {
+      delay(400);
+      Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      connected = true;
+    }
+    Serial.println();
+  }
+
+  // 3. Try Fallback Wi-Fi (IoT Lab)
+  if (!connected) {
+    Serial.print("Connecting to Fallback Wi-Fi (");
+    Serial.print(FALLBACK_WIFI_SSID);
+    Serial.print(") ... ");
+    WiFi.disconnect();
+    delay(200);
+    WiFi.begin(FALLBACK_WIFI_SSID, FALLBACK_WIFI_PASS);
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 6000) {
+      delay(400);
+      Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      connected = true;
+    }
+    Serial.println();
+  }
+
+  if (connected) {
+    Serial.println("====================================");
+    Serial.print(">>> WiFi Connected! IP: ");
+    Serial.println(WiFi.localIP());
+    Serial.println("====================================");
+  } else {
+    Serial.println("====================================");
+    Serial.println("[!] Wi-Fi Connection FAILED / TIMED OUT");
+    Serial.println("[!] ESP32 HOTSPOT ACTIVE:");
+    Serial.print("    SSID:          "); Serial.println(AP_SSID);
+    Serial.print("    Password:      "); Serial.println(AP_PASS);
+    Serial.println("    Web Setup URL: http://192.168.4.1/wifi");
+    Serial.println("[!] Connect your phone/laptop to configure any Wi-Fi!");
+    Serial.println("====================================");
+  }
+}
+
+/* =====================================================
    EMBEDDED HTML WEB INTERFACE (LOCAL AP / WIFI ACCESS)
    ===================================================== */
 
@@ -1253,8 +1507,15 @@ input{width:100%;padding:12px;border:1px solid #cbd5e1;border-radius:9px;font-si
 <body>
 <div class="container">
 <div class="header">
-<h1>💧 Smart Water Tank Controller</h1>
-<p>ESP32 • HC-SR04 • 2× LPF • 5 Second Statistical Filtering • MQTT Ready</p>
+  <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;">
+    <div>
+      <h1 style="margin:0;">💧 Smart Water Tank Controller</h1>
+      <p style="margin:5px 0 0 0;color:#64748b;">ESP32 • HC-SR04 • 2× LPF • 5 Second Statistical Filtering • MQTT Ready</p>
+    </div>
+    <div>
+      <a href="/wifi" style="display:inline-block;background:#0284c7;color:white;padding:10px 16px;border-radius:10px;text-decoration:none;font-weight:bold;font-size:14px;">📶 Wi-Fi Settings</a>
+    </div>
+  </div>
 </div>
 <div class="card">
 <h2 class="sectionTitle">⚡ Motor Control</h2>
@@ -1414,55 +1675,28 @@ void setup() {
   motorOFF();
 
   loadSettings();
+  loadWiFiSettings();
   calculateTank();
 
-  // AP + STA Mode
+  // AP + STA Mode with Static IP for Hotspot Setup
   WiFi.mode(WIFI_AP_STA);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
   WiFi.softAP(AP_SSID, AP_PASS);
+
+  // Start Captive DNS Server (Port 53)
+  dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
 
   Serial.println();
   Serial.println("====================================");
   Serial.println("SMART WATER CONTROLLER (MQTT + WEB)");
   Serial.println("====================================");
-  Serial.print("ESP32 AP IP: ");
+  Serial.print("ESP32 AP Hotspot IP:   ");
   Serial.println(WiFi.softAPIP());
+  Serial.print("ESP32 AP Hotspot SSID: ");
+  Serial.println(AP_SSID);
 
-  // Connect to WiFi (Try WiFi 1 first, fallback to WiFi 2)
-  Serial.print("Connecting to WiFi: ");
-  Serial.print(WIFI_SSID_1);
-  Serial.print(" ... ");
-  WiFi.begin(WIFI_SSID_1, WIFI_PASS_1);
-
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 5000) {
-    delay(400);
-    Serial.print(".");
-  }
-
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println();
-    Serial.print("WiFi 1 not found. Trying WiFi 2: ");
-    Serial.print(WIFI_SSID_2);
-    Serial.print(" ... ");
-    WiFi.disconnect();
-    delay(200);
-    WiFi.begin(WIFI_SSID_2, WIFI_PASS_2);
-
-    start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 8000) {
-      delay(400);
-      Serial.print(".");
-    }
-  }
-
-  Serial.println();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print(">>> WiFi Connected! IP: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println(">>> WiFi Timeout. Running in AP mode.");
-  }
+  // Connect to Wi-Fi (Configured -> Primary WIFI/RAHAT -> Fallback)
+  attemptWiFiConnection();
 
   // Setup MQTT
   mqtt.setServer(MQTT_BROKER, MQTT_PORT);
@@ -1479,6 +1713,18 @@ void setup() {
   server.on("/calibrate", calibrationAPI);
   server.on("/resetUsage", resetUsageAPI);
   server.on("/resetAll", resetAllAPI);
+
+  // WiFi Hotspot Configuration Routes
+  server.on("/wifi", handleWifiPage);
+  server.on("/wifisave", handleWifiSave);
+
+  // Captive Portal Detection Redirects
+  server.on("/generate_204", handleCaptiveRedirect);
+  server.on("/gen_204", handleCaptiveRedirect);
+  server.on("/hotspot-detect.html", handleCaptiveRedirect);
+  server.on("/canonical.html", handleCaptiveRedirect);
+  server.on("/ncsi.txt", handleCaptiveRedirect);
+  server.on("/connecttest.txt", handleCaptiveRedirect);
 
   server.begin();
 
@@ -1497,6 +1743,9 @@ void setup() {
    ===================================================== */
 
 void loop() {
+  // Handle Captive Portal DNS queries
+  dnsServer.processNextRequest();
+
   // Handle HTTP client
   server.handleClient();
 
