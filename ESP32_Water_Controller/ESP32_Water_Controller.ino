@@ -47,11 +47,13 @@ String configuredPASS = "";
 
 /* ================= MQTT CREDENTIALS & TOPICS ================= */
 
-const char* MQTT_BROKER    = "192.168.110.133";
-const int   MQTT_PORT      = 1883;
-const char* MQTT_USER      = "rahat300809";
-const char* MQTT_PASS      = "RAHAT678";
-const char* MQTT_CLIENT_ID = "ESP32_WATER_01";
+const char* MQTT_BROKER_VM   = "192.168.110.133";
+const char* MQTT_BROKER_HOST = "192.168.0.104";
+String currentBroker         = "192.168.110.133";
+const int   MQTT_PORT        = 1883;
+const char* MQTT_USER        = "rahat300809";
+const char* MQTT_PASS        = "RAHAT678";
+const char* MQTT_CLIENT_ID   = "ESP32_WATER_01";
 
 const char* TOPIC_TELEMETRY = "devices/ESP32_WATER_01/telemetry";
 const char* TOPIC_COMMAND   = "devices/ESP32_WATER_01/command";
@@ -1104,13 +1106,14 @@ void handleMQTT() {
   }
 
   unsigned long now = millis();
-  if (now - lastMqttRetry >= 4000) {
+  if (now - lastMqttRetry >= 3000) {
     lastMqttRetry = now;
 
     Serial.print("Attempting MQTT connection to ");
-    Serial.print(MQTT_BROKER);
+    Serial.print(currentBroker);
     Serial.print("...");
 
+    mqtt.setServer(currentBroker.c_str(), MQTT_PORT);
     if (mqtt.connect(MQTT_CLIENT_ID, MQTT_USER, MQTT_PASS)) {
       Serial.println(" CONNECTED!");
       mqtt.subscribe(TOPIC_COMMAND);
@@ -1118,6 +1121,13 @@ void handleMQTT() {
     } else {
       Serial.print(" FAILED, rc=");
       Serial.println(mqtt.state());
+
+      // Toggle between VM direct IP (192.168.110.133) and Host LAN Relay IP (192.168.0.104)
+      if (currentBroker == MQTT_BROKER_VM) {
+        currentBroker = MQTT_BROKER_HOST;
+      } else {
+        currentBroker = MQTT_BROKER_VM;
+      }
     }
   }
 }
@@ -1699,9 +1709,10 @@ void setup() {
   attemptWiFiConnection();
 
   // Setup MQTT
-  mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+  mqtt.setServer(currentBroker.c_str(), MQTT_PORT);
   mqtt.setCallback(mqttCallback);
   mqtt.setBufferSize(1024); // Large buffer for full telemetry JSON
+  mqtt.setSocketTimeout(2); // 2s fail-fast timeout so webserver stays fast
 
   // Embedded WebServer Routes
   server.on("/", []() {
