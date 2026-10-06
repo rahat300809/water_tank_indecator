@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Smart Water Tank Controller - ESP32 MQTT</title>
+  <meta name="description" content="Real-time ESP32 Water Tank Controller with MQTT Telemetry and Control">
+  <link rel="stylesheet" href="style.css?v=2">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+</head>
+<body>
+
+<div class="container">
+
+  <!-- HEADER -->
+  <header class="header">
+    <div class="header-info">
+      <h1>💧 Smart Water Tank Controller</h1>
+      <p>ESP32 • HC-SR04 • 2× LPF • Robust Statistics • MQTT Realtime</p>
+    </div>
+    <div class="header-actions">
+      <div id="mqttBadge" class="mqtt-badge connecting">
+        <span class="status-dot"></span>
+        <span id="mqttStatusText">Connecting...</span>
+      </div>
+      <button class="btn-icon" id="settingsBtn" title="MQTT Settings">
+        ⚙️ Settings
+      </button>
+    </div>
+  </header>
+
+  <!-- MOTOR CONTROL -->
+  <section class="card">
+    <h2 class="section-title">⚡ Motor Control</h2>
+    <div class="motor-box">
+      <div id="motorStatus" class="motor-status motor-off">OFF</div>
+      <div class="mode-badge">
+        Mode: <strong id="motorMode">AUTO</strong>
+      </div>
+      <div id="systemState" class="notice">NORMAL</div>
+      <div id="countdown" class="countdown">System stable</div>
+    </div>
+
+    <div class="btn-group">
+      <button class="btn-green" id="btnManualOn" onclick="sendMotorCommand('on')">
+        MANUAL ON
+      </button>
+      <button class="btn-red" id="btnManualOff" onclick="sendMotorCommand('off')">
+        MANUAL OFF
+      </button>
+      <button class="btn-blue" id="btnAuto" onclick="sendMotorCommand('auto')">
+        AUTO
+      </button>
+    </div>
+  </section>
+
+  <!-- WATER TANK VISUALIZER -->
+  <section class="card">
+    <h2 class="section-title">💧 Water Tank</h2>
+    <div class="tank-wrapper">
+      <div class="tank-container">
+        <div class="tank">
+          <div id="water" class="water"></div>
+          <div id="waterText" class="water-text">0.0%</div>
+        </div>
+        <div class="marker m25">25%</div>
+        <div class="marker m50">50%</div>
+        <div class="marker m75">75%</div>
+        <div class="marker m100">100%</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- STATS GRID -->
+  <section class="grid">
+    <div class="stat">
+      <div class="label">Filtered Distance</div>
+      <div class="value"><span id="distance">0.00</span><span class="unit">cm</span></div>
+    </div>
+    <div class="stat">
+      <div class="label">Water Level</div>
+      <div class="value"><span id="level">0.00</span><span class="unit">cm</span></div>
+    </div>
+    <div class="stat">
+      <div class="label">Current Water</div>
+      <div class="value"><span id="liters">0.00</span><span class="unit">L</span></div>
+    </div>
+    <div class="stat">
+      <div class="label">Tank Capacity</div>
+      <div class="value"><span id="capacity">0.00</span><span class="unit">L</span></div>
+    </div>
+    <div class="stat">
+      <div class="label">Total Water Used</div>
+      <div class="value"><span id="used">0.00</span><span class="unit">L</span></div>
+    </div>
+  </section>
+  <br>
+
+  <!-- MOTOR THRESHOLDS -->
+  <section class="card">
+    <h2 class="section-title">🎚 Motor Thresholds</h2>
+    <div class="grid">
+      <div class="threshold">
+        <strong>Motor ON</strong><br>
+        Water ≤ <span id="onDisplay">25.0</span>%<br>
+        <span class="small">20 second confirmation verification</span>
+      </div>
+      <div class="threshold">
+        <strong>Motor OFF</strong><br>
+        Water ≥ <span id="offDisplay">75.0</span>%<br>
+        <span class="small">10 second confirmation verification</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- TANK & MOTOR SETTINGS -->
+  <section class="card">
+    <h2 class="section-title">⚙️ Tank & Motor Settings</h2>
+    <div class="grid">
+      <div>
+        <label for="radius">Tank Radius (cm)</label>
+        <input id="radius" type="number" step="0.1" oninput="settingsChanged=true">
+      </div>
+      <div>
+        <label for="height">Tank Height (cm)</label>
+        <input id="height" type="number" step="0.1" oninput="settingsChanged=true">
+      </div>
+      <div>
+        <label for="on">Motor ON (%)</label>
+        <input id="on" type="number" min="0" max="100" step="1" oninput="settingsChanged=true">
+      </div>
+      <div>
+        <label for="off">Motor OFF (%)</label>
+        <input id="off" type="number" min="0" max="100" step="1" oninput="settingsChanged=true">
+      </div>
+      <div>
+        <label for="offset">Sensor Offset (cm)</label>
+        <input id="offset" type="number" step="0.1" oninput="settingsChanged=true">
+      </div>
+    </div>
+    <br>
+    <div class="center">
+      <button class="btn-blue" onclick="saveSettings()">
+        💾 SAVE SETTINGS
+      </button>
+    </div>
+  </section>
+
+  <!-- SENSOR CALIBRATION -->
+  <section class="card">
+    <h2 class="section-title">🎯 Sensor Calibration</h2>
+    <div id="calNotice" class="notice">
+      Keep tank steady before calibration.
+    </div>
+
+    <div class="progress">
+      <div id="calBar" class="progress-bar"></div>
+    </div>
+
+    <p class="center" style="margin-bottom: 16px;">
+      <strong id="calTimer">Ready</strong>
+    </p>
+
+    <div class="btn-group">
+      <button class="btn-purple" onclick="calibrate('empty')">
+        CALIBRATE EMPTY
+      </button>
+      <button class="btn-purple" onclick="calibrate('full')">
+        CALIBRATE FULL
+      </button>
+    </div>
+    <br>
+
+    <div class="grid">
+      <div class="stat">
+        <div class="label">Empty Distance</div>
+        <div class="value"><span id="empty">0.00</span><span class="unit">cm</span></div>
+      </div>
+      <div class="stat">
+        <div class="label">Full Distance</div>
+        <div class="value"><span id="full">0.00</span><span class="unit">cm</span></div>
+      </div>
+      <div class="stat">
+        <div class="label">Calibration Status</div>
+        <div class="value" id="calibrated">NO</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- RESET -->
+  <section class="card">
+    <h2 class="section-title">🔄 Reset Controls</h2>
+    <div class="btn-group">
+      <button class="btn-orange" onclick="resetUsage()">
+        RESET WATER USED
+      </button>
+      <button class="btn-gray" onclick="resetAll()">
+        RESET ALL SETTINGS
+      </button>
+    </div>
+    <p class="small center" style="margin-top: 12px;">
+      Reset All clears saved tank geometry, calibration distances and accumulated water usage.
+    </p>
+  </section>
+
+  <!-- ALGORITHM SUMMARY -->
+  <section class="card">
+    <h2 class="section-title">🧠 Filter & Control Pipeline</h2>
+    <p class="small" style="line-height: 1.8;">
+      • <strong>Sampling:</strong> 0.5s intervals using HC-SR04 ultrasonic pulses.<br>
+      • <strong>Spike Suppression:</strong> Cascaded 2× Low-Pass Filters (α₁ = 0.35, α₂ = 0.25).<br>
+      • <strong>Statistical Engine:</strong> 5s window with Median + MAD (Median Absolute Deviation) robust mean.<br>
+      • <strong>Dual Hysteresis:</strong> Low threshold (≤ ON%) triggers 20s confirmation; High threshold (≥ OFF%) triggers 10s confirmation.<br>
+      • <strong>Telemetry:</strong> Realtime MQTT publishing over <code>devices/ESP32_WATER_01/telemetry</code>.<br>
+      • <strong>Remote Control:</strong> Bi-directional MQTT commands via <code>devices/ESP32_WATER_01/command</code>.
+    </p>
+  </section>
+
+</div>
+
+<!-- MQTT SETTINGS MODAL -->
+<div id="settingsModal" class="modal-overlay">
+  <div class="modal">
+    <div class="modal-header">
+      <h3>MQTT Connection Settings</h3>
+      <button class="modal-close" onclick="closeSettingsModal()">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div>
+        <label for="mqttHost">Broker Host / Domain</label>
+        <input id="mqttHost" type="text" placeholder="rahat.eu.cc or 192.168.110.133">
+      </div>
+      <div>
+        <label for="mqttPort">Port (WebSocket)</label>
+        <input id="mqttPort" type="number" placeholder="443 or 9001">
+      </div>
+      <div>
+        <label for="mqttPath">Path</label>
+        <input id="mqttPath" type="text" placeholder="/mqtt or /">
+      </div>
+      <div>
+        <label for="mqttUser">MQTT Username</label>
+        <input id="mqttUser" type="text" placeholder="rahat300809">
+      </div>
+      <div>
+        <label for="mqttPass">MQTT Password</label>
+        <input id="mqttPass" type="password" placeholder="RAHAT678">
+      </div>
+      <div>
+        <label for="mqttTelemetryTopic">Telemetry Topic</label>
+        <input id="mqttTelemetryTopic" type="text" placeholder="devices/ESP32_WATER_01/telemetry">
+      </div>
+      <div>
+        <label for="mqttCommandTopic">Command Topic</label>
+        <input id="mqttCommandTopic" type="text" placeholder="devices/ESP32_WATER_01/command">
+      </div>
+    </div>
+    <div class="modal-footer">
+      <button class="btn-gray" onclick="closeSettingsModal()">Cancel</button>
+      <button class="btn-blue" onclick="saveMqttConfig()">Save & Reconnect</button>
+    </div>
+  </div>
+</div>
+
+<!-- TOAST CONTAINER -->
+<div id="toastContainer" class="toast-container"></div>
+
+<!-- SCRIPTS: Local bundle with CDN fallback -->
+<script src="mqtt.min.js"></script>
+<script>
+  if (typeof mqtt === 'undefined') {
+    document.write('<script src="https://unpkg.com/mqtt@5.3.5/dist/mqtt.min.js"><\/script>');
+  }
+</script>
+<script src="app.js?v=2"></script>
+
+</body>
+</html>
