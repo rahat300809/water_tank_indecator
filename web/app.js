@@ -1,6 +1,6 @@
 /* =====================================================
    Smart Water Tank Controller - Web Frontend Logic
-   Realtime MQTT Pub/Sub + Fluid Tank Animation
+   Universal MQTT Pub/Sub + Fluid Tank Animation + Optimistic Triggers
    ===================================================== */
 
 let settingsChanged = false;
@@ -19,14 +19,12 @@ const DEFAULT_CONFIG = {
   commandTopic: 'devices/ESP32_WATER_01/command'
 };
 
-// If loaded directly from local file (file://) or localhost
 if (!DEFAULT_CONFIG.host || DEFAULT_CONFIG.host === 'localhost' || DEFAULT_CONFIG.host === '127.0.0.1') {
   DEFAULT_CONFIG.host = '192.168.110.133';
   DEFAULT_CONFIG.port = 9001;
   DEFAULT_CONFIG.path = '';
 }
 
-// Load persisted config or defaults
 let config = { ...DEFAULT_CONFIG };
 try {
   const saved = localStorage.getItem('water_mqtt_config');
@@ -39,6 +37,7 @@ try {
 
 let client = null;
 let lastTelemetryTime = 0;
+let telemetryReceived = false;
 
 /* =====================================================
    MQTT CONNECTION
@@ -53,15 +52,12 @@ function connectMqtt() {
 
   updateMqttStatus('connecting', 'Connecting...');
 
-  // Build WebSocket URL
   const isSsl = window.location.protocol === 'https:' || config.port === 443;
   const protocol = isSsl ? 'wss' : 'ws';
   
-  // Format clean URL
   let cleanPath = config.path || '';
   if (cleanPath && !cleanPath.startsWith('/')) cleanPath = '/' + cleanPath;
   
-  // Port omission for standard 80/443
   const portPart = (config.port && config.port !== 80 && config.port !== 443) ? `:${config.port}` : '';
   const brokerUrl = `${protocol}://${config.host}${portPart}${cleanPath}`;
 
@@ -83,7 +79,7 @@ function connectMqtt() {
 
     client.on('connect', () => {
       console.log('MQTT Connected successfully to', brokerUrl);
-      updateMqttStatus('connected', 'Live MQTT');
+      updateMqttStatus('connected', 'MQTT Connected');
       showToast('Connected to MQTT Broker', 'success');
 
       // Subscribe to telemetry topic
@@ -93,8 +89,8 @@ function connectMqtt() {
           showToast('Failed to subscribe to telemetry', 'error');
         } else {
           console.log('Subscribed to:', config.telemetryTopic);
-          // Request immediate status from ESP32
-          sendCommand({ action: 'status' });
+          // Send request for status
+          sendCommand({ command: 'STATUS', action: 'status' });
         }
       });
     });
@@ -102,8 +98,10 @@ function connectMqtt() {
     client.on('message', (topic, payload) => {
       if (topic === config.telemetryTopic) {
         try {
-          const data = JSON.parse(payload.toString());
+          const rawStr = payload.toString();
+          const data = JSON.parse(rawStr);
           lastTelemetryTime = Date.now();
+          telemetryReceived = true;
           applyTelemetry(data);
         } catch (err) {
           console.error('Invalid telemetry JSON:', err, payload.toString());
@@ -146,12 +144,12 @@ function updateMqttStatus(statusClass, label) {
 }
 
 /* =====================================================
-   COMMAND PUBLISHER
+   COMMAND PUBLISHER (UNIVERSAL FORMAT)
    ===================================================== */
 
 function sendCommand(cmdObj) {
   if (!client || !client.connected) {
-    showToast('MQTT not connected! Cannot send command.', 'error');
+    showToast('MQTT not connected! Please check connection.', 'error');
     return false;
   }
 
@@ -161,7 +159,7 @@ function sendCommand(cmdObj) {
       console.error('Command publish failed:', err);
       showToast('Failed to send command', 'error');
     } else {
-      console.log('Command sent:', payload);
+      console.log('Command sent to', config.commandTopic, ':', payload);
     }
   });
   return true;
@@ -169,13 +167,14 @@ function sendCommand(cmdObj) {
 
 /* =====================================================
    DATA TELEMETRY HANDLER
-   Matches ESP32 payload structure 1:1
+   Supports both standard and alternative JSON keys
    ===================================================== */
 
 function applyTelemetry(d) {
-  // Set target water percent for smooth animation
-  if (typeof d.percent === 'number') {
-    targetWaterPercent = d.percent;
+  // Extract percent (support .percent or .water_percent)
+  const percentVal = d.percent !== undefined ? d.percent : d.water_percent;
+  if (percentVal !== undefined && percentVal !== null) {
+    targetWaterPercent = parseFloat(percentVal);
     if (!uiAnimationStarted) {
       uiWaterPercent = targetWaterPercent;
       uiAnimationStarted = true;
@@ -183,35 +182,45 @@ function applyTelemetry(d) {
   }
 
   // Stats Grid
-  if (d.distance !== undefined) document.getElementById('distance').innerText = Number(d.distance).toFixed(2);
-  if (d.level !== undefined) document.getElementById('level').innerText = Number(d.level).toFixed(2);
-  if (d.liters !== undefined) document.getElementById('liters').innerText = Number(d.liters).toFixed(2);
-  if (d.capacity !== undefined) document.getElementById('capacity').innerText = Number(d.capacity).toFixed(2);
-  if (d.used !== undefined) document.getElementById('used').innerText = Number(d.used).toFixed(2);
+  const distVal = d.distance !== undefined ? d.distance : (d.raw_distance !== undefined ? d.raw_distance : null);
+  if (distVal !== null) document.getElementById('distance').innerText = Number(distVal).toFixed(2);
+
+  const levelVal = d.level !== undefined ? d.level : d.water_level;
+  if (levelVal !== undefined) document.getElementById('level').innerText = Number(levelVal).toFixed(2);
+
+  const litersVal = d.liters !== undefined ? d.liters : d.water_liters;
+  if (litersVal !== undefined) document.getElementById('liters').innerText = Number(litersVal).toFixed(2);
+
+  const capVal = d.capacity !== undefined ? d.capacity : d.tank_capacity;
+  if (capVal !== undefined) document.getElementById('capacity').innerText = Number(capVal).toFixed(2);
+
+  const usedVal = d.used !== undefined ? d.used : d.water_used;
+  if (usedVal !== undefined) document.getElementById('used').innerText = Number(usedVal).toFixed(2);
 
   // Motor Status & Mode
+  const isRelayOn = d.relay === true || d.relay === 'true' || d.motor === true || d.motor === 'true' || d.motor_state === 'ON';
   const motorStatusEl = document.getElementById('motorStatus');
-  const isRelayOn = d.relay === true || d.relay === 'true';
   if (motorStatusEl) {
     motorStatusEl.innerText = isRelayOn ? 'ON' : 'OFF';
     motorStatusEl.className = 'motor-status ' + (isRelayOn ? 'motor-on' : 'motor-off');
   }
 
-  if (d.mode) {
-    document.getElementById('motorMode').innerText = d.mode;
+  const modeVal = d.mode || d.motor_mode;
+  if (modeVal) {
+    document.getElementById('motorMode').innerText = modeVal.toUpperCase();
   }
 
   // System State & Countdowns
   const stateEl = document.getElementById('systemState');
   const countdownEl = document.getElementById('countdown');
-  const state = d.state || 'NORMAL';
+  const state = d.state || d.system_state || 'NORMAL';
 
   if (stateEl) {
     stateEl.innerText = state;
     stateEl.className = 'notice';
 
     if (state === 'NORMAL') {
-      if (countdownEl) countdownEl.innerText = 'System stable';
+      if (countdownEl) countdownEl.innerText = 'System stable • Telemetry active';
     } else if (state === 'VERIFY_ON') {
       stateEl.classList.add('verify-on');
       if (countdownEl) countdownEl.innerText = `🔎 Confirming MOTOR ON — ${d.remaining || 0}s remaining`;
@@ -225,12 +234,18 @@ function applyTelemetry(d) {
   }
 
   // Motor Thresholds
-  if (d.on !== undefined) document.getElementById('onDisplay').innerText = Number(d.on).toFixed(1);
-  if (d.off !== undefined) document.getElementById('offDisplay').innerText = Number(d.off).toFixed(1);
+  const onVal = d.on !== undefined ? d.on : d.motor_on_percent;
+  if (onVal !== undefined) document.getElementById('onDisplay').innerText = Number(onVal).toFixed(1);
+
+  const offVal = d.off !== undefined ? d.off : d.motor_off_percent;
+  if (offVal !== undefined) document.getElementById('offDisplay').innerText = Number(offVal).toFixed(1);
 
   // Calibration Info
-  if (d.empty !== undefined) document.getElementById('empty').innerText = Number(d.empty).toFixed(2);
-  if (d.full !== undefined) document.getElementById('full').innerText = Number(d.full).toFixed(2);
+  const emptyVal = d.empty !== undefined ? d.empty : d.empty_distance;
+  if (emptyVal !== undefined) document.getElementById('empty').innerText = Number(emptyVal).toFixed(2);
+
+  const fullVal = d.full !== undefined ? d.full : d.full_distance;
+  if (fullVal !== undefined) document.getElementById('full').innerText = Number(fullVal).toFixed(2);
 
   const isCalibrated = d.calibrated === true || d.calibrated === 'true';
   const calBadge = document.getElementById('calibrated');
@@ -240,7 +255,7 @@ function applyTelemetry(d) {
   }
 
   // Calibration progress
-  const isCalRunning = d.calibrationRunning === true || d.calibrationRunning === 'true';
+  const isCalRunning = d.calibrationRunning === true || d.calibrationRunning === 'true' || d.calibration_running === true || d.calibration_running === 'true';
   const calNoticeEl = document.getElementById('calNotice');
   const calBarEl = document.getElementById('calBar');
   const calTimerEl = document.getElementById('calTimer');
@@ -255,19 +270,24 @@ function applyTelemetry(d) {
     if (calTimerEl) calTimerEl.innerText = 'Ready';
   }
 
-  // Form Fields (Prevent overwriting if user is editing)
+  // Form Fields (Prevent overwriting if user is typing)
   if (!settingsChanged) {
-    if (d.radius !== undefined) document.getElementById('radius').value = d.radius;
-    if (d.height !== undefined) document.getElementById('height').value = d.height;
-    if (d.on !== undefined) document.getElementById('on').value = d.on;
-    if (d.off !== undefined) document.getElementById('off').value = d.off;
-    if (d.offset !== undefined) document.getElementById('offset').value = d.offset;
+    const radVal = d.radius !== undefined ? d.radius : d.tank_radius;
+    if (radVal !== undefined) document.getElementById('radius').value = radVal;
+
+    const hVal = d.height !== undefined ? d.height : d.tank_height;
+    if (hVal !== undefined) document.getElementById('height').value = hVal;
+
+    if (onVal !== undefined) document.getElementById('on').value = onVal;
+    if (offVal !== undefined) document.getElementById('off').value = offVal;
+
+    const offsetVal = d.offset !== undefined ? d.offset : d.sensor_offset;
+    if (offsetVal !== undefined) document.getElementById('offset').value = offsetVal;
   }
 }
 
 /* =====================================================
    FLUID WATER ANIMATION (20 FPS)
-   Identical smooth convergence formula to original ESP32 code
    ===================================================== */
 
 function animateWater() {
@@ -283,7 +303,6 @@ function animateWater() {
     uiWaterPercent += difference * 0.025;
   }
 
-  // Snap to target if very close
   if (Math.abs(targetWaterPercent - uiWaterPercent) < 0.05) {
     uiWaterPercent = targetWaterPercent;
   }
@@ -301,12 +320,52 @@ function animateWater() {
 setInterval(animateWater, 50);
 
 /* =====================================================
-   USER ACTIONS
+   USER TRIGGER ACTIONS (OPTIMISTIC + DUAL SCHEMA)
    ===================================================== */
 
 function sendMotorCommand(state) {
-  if (sendCommand({ action: 'motor', state: state })) {
-    showToast(`Command sent: Motor ${state.toUpperCase()}`, 'info');
+  const motorStatusEl = document.getElementById('motorStatus');
+  const motorModeEl = document.getElementById('motorMode');
+
+  // Universal payload that matches both sketch versions
+  let payload = {};
+  if (state === 'on') {
+    payload = {
+      command: 'MOTOR',
+      value: 'ON',
+      action: 'motor',
+      state: 'on'
+    };
+    // Optimistic UI update
+    if (motorStatusEl) {
+      motorStatusEl.innerText = 'ON';
+      motorStatusEl.className = 'motor-status motor-on';
+    }
+    if (motorModeEl) motorModeEl.innerText = 'MANUAL';
+  } else if (state === 'off') {
+    payload = {
+      command: 'MOTOR',
+      value: 'OFF',
+      action: 'motor',
+      state: 'off'
+    };
+    if (motorStatusEl) {
+      motorStatusEl.innerText = 'OFF';
+      motorStatusEl.className = 'motor-status motor-off';
+    }
+    if (motorModeEl) motorModeEl.innerText = 'MANUAL';
+  } else if (state === 'auto') {
+    payload = {
+      command: 'MODE',
+      value: 'AUTO',
+      action: 'motor',
+      state: 'auto'
+    };
+    if (motorModeEl) motorModeEl.innerText = 'AUTO';
+  }
+
+  if (sendCommand(payload)) {
+    showToast(`Trigger sent: Motor ${state.toUpperCase()}`, 'info');
   }
 }
 
@@ -327,18 +386,27 @@ function saveSettings() {
     return;
   }
 
+  // Universal payload
   const payload = {
+    command: 'SETTINGS',
     action: 'save',
-    radius: radius,
-    height: height,
+    motor_on_percent: on,
+    motor_off_percent: off,
+    tank_radius: radius,
+    tank_height: height,
+    sensor_offset: offset,
     on: on,
     off: off,
+    radius: radius,
+    height: height,
     offset: offset
   };
 
   if (sendCommand(payload)) {
     settingsChanged = false;
-    showToast('Settings saved & transmitted to ESP32', 'success');
+    document.getElementById('onDisplay').innerText = on.toFixed(1);
+    document.getElementById('offDisplay').innerText = off.toFixed(1);
+    showToast('Settings saved & sent to ESP32', 'success');
   }
 }
 
@@ -347,8 +415,14 @@ function calibrate(type) {
     return;
   }
 
-  if (sendCommand({ action: 'calibrate', type: type })) {
-    showToast(`Starting ${type} calibration (10 seconds)`, 'info');
+  const payload = {
+    command: 'CALIBRATE',
+    type: type,
+    action: 'calibrate'
+  };
+
+  if (sendCommand(payload)) {
+    showToast(`Starting ${type} calibration`, 'info');
   }
 }
 
@@ -357,17 +431,28 @@ function resetUsage() {
     return;
   }
 
-  if (sendCommand({ action: 'resetUsage' })) {
+  const payload = {
+    command: 'RESET_USAGE',
+    action: 'resetUsage'
+  };
+
+  if (sendCommand(payload)) {
+    document.getElementById('used').innerText = '0.00';
     showToast('Water usage reset sent', 'info');
   }
 }
 
 function resetAll() {
-  if (!confirm('Reset ALL settings, calibration data, and water usage to factory defaults?')) {
+  if (!confirm('Reset ALL settings, calibration data, and water usage to defaults?')) {
     return;
   }
 
-  if (sendCommand({ action: 'resetAll' })) {
+  const payload = {
+    command: 'RESET_ALL',
+    action: 'resetAll'
+  };
+
+  if (sendCommand(payload)) {
     settingsChanged = false;
     uiWaterPercent = 0;
     targetWaterPercent = 0;

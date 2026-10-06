@@ -26,13 +26,17 @@
 #define ECHO_PIN 18
 #define RELAY_PIN 25
 
-/* ================= WIFI CREDENTIALS ================= */
+/* ================= WIFI CREDENTIALS (DUAL NETWORK SUPPORT) ================= */
 
 const char* AP_SSID = "ESP32_Water_Setup";
 const char* AP_PASS = "12345678";
 
-const char* WIFI_SSID = "IoT Lab";
-const char* WIFI_PASS = "iot@diu123";
+// Primary & Secondary Wi-Fi Networks
+const char* WIFI_SSID_1 = "IoT Lab";
+const char* WIFI_PASS_1 = "iot@diu123";
+
+const char* WIFI_SSID_2 = "WIFI";
+const char* WIFI_PASS_2 = "RAHAT1234";
 
 /* ================= MQTT CREDENTIALS & TOPICS ================= */
 
@@ -856,25 +860,43 @@ String buildTelemetryJSON() {
   }
 
   String json = "{";
+  json += "\"device_id\":\"ESP32_WATER_01\",";
   json += "\"distance\":" + String(filteredDistance, 2) + ",";
+  json += "\"raw_distance\":" + String(rawDistance, 2) + ",";
   json += "\"level\":" + String(currentLevel, 2) + ",";
+  json += "\"water_level\":" + String(currentLevel, 2) + ",";
   json += "\"percent\":" + String(currentPercent, 2) + ",";
+  json += "\"water_percent\":" + String(currentPercent, 2) + ",";
   json += "\"liters\":" + String(currentLiters, 2) + ",";
+  json += "\"water_liters\":" + String(currentLiters, 2) + ",";
   json += "\"capacity\":" + String(tankCapacity, 2) + ",";
+  json += "\"tank_capacity\":" + String(tankCapacity, 2) + ",";
   json += "\"used\":" + String(totalWaterUsed, 2) + ",";
+  json += "\"water_used\":" + String(totalWaterUsed, 2) + ",";
   json += "\"radius\":" + String(tankRadius, 2) + ",";
+  json += "\"tank_radius\":" + String(tankRadius, 2) + ",";
   json += "\"height\":" + String(tankHeight, 2) + ",";
+  json += "\"tank_height\":" + String(tankHeight, 2) + ",";
   json += "\"on\":" + String(motorOnPercent, 1) + ",";
+  json += "\"motor_on_percent\":" + String(motorOnPercent, 1) + ",";
   json += "\"off\":" + String(motorOffPercent, 1) + ",";
+  json += "\"motor_off_percent\":" + String(motorOffPercent, 1) + ",";
   json += "\"offset\":" + String(sensorOffset, 2) + ",";
+  json += "\"sensor_offset\":" + String(sensorOffset, 2) + ",";
   json += "\"empty\":" + String(emptyDistance, 2) + ",";
+  json += "\"empty_distance\":" + String(emptyDistance, 2) + ",";
   json += "\"full\":" + String(fullDistance, 2) + ",";
+  json += "\"full_distance\":" + String(fullDistance, 2) + ",";
   json += "\"calibrated\":" + String(calibrationReady ? "true" : "false") + ",";
   json += "\"calibrationRunning\":" + String(calibrationRunning ? "true" : "false") + ",";
+  json += "\"calibration_running\":" + String(calibrationRunning ? "true" : "false") + ",";
   json += "\"relay\":" + String(relayState ? "true" : "false") + ",";
   json += "\"motor\":" + String(relayState ? "true" : "false") + ",";
+  json += "\"motor_state\":\"" + String(relayState ? "ON" : "OFF") + "\",";
   json += "\"mode\":\"" + motorMode + "\",";
+  json += "\"motor_mode\":\"" + motorMode + "\",";
   json += "\"state\":\"" + state + "\",";
+  json += "\"system_state\":\"" + state + "\",";
   json += "\"remaining\":" + String(remaining) + ",";
   json += "\"calType\":\"" + calibrationType + "\",";
   json += "\"progress\":" + String(progress, 1);
@@ -941,14 +963,18 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
   String action = extractJsonString(message, "action");
   if (action == "") action = extractJsonString(message, "command");
+  action.toLowerCase();
 
-  /* --- 1. MOTOR COMMAND --- */
-  if (action == "motor" || message.startsWith("motor:")) {
-    String state = extractJsonString(message, "state");
+  String state = extractJsonString(message, "state");
+  if (state == "") state = extractJsonString(message, "value");
+  state.toLowerCase();
+
+  /* --- 1. MOTOR & MODE COMMANDS --- */
+  if (action == "motor" || action == "mode" || message.startsWith("motor:")) {
     if (state == "" && message.indexOf(":") != -1) {
       state = message.substring(message.indexOf(":") + 1);
+      state.toLowerCase();
     }
-    state.toLowerCase();
 
     if (state == "on") {
       motorMode = "MANUAL";
@@ -967,6 +993,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       confirmationRunning = false;
       confirmationCancelled = false;
       confirmCount = 0;
+      Serial.println(">>> AUTO MODE ENABLED VIA MQTT");
       if (!calibrationReady) {
         motorOFF();
       }
@@ -975,12 +1002,21 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 
   /* --- 2. SAVE SETTINGS COMMAND --- */
-  else if (action == "save") {
-    float newRadius = extractJsonFloat(message, "radius", tankRadius);
-    float newHeight = extractJsonFloat(message, "height", tankHeight);
-    float newOn     = extractJsonFloat(message, "on", motorOnPercent);
-    float newOff    = extractJsonFloat(message, "off", motorOffPercent);
-    float newOffset = extractJsonFloat(message, "offset", sensorOffset);
+  else if (action == "save" || action == "settings") {
+    float newRadius = extractJsonFloat(message, "radius", -1);
+    if (newRadius < 0) newRadius = extractJsonFloat(message, "tank_radius", tankRadius);
+
+    float newHeight = extractJsonFloat(message, "height", -1);
+    if (newHeight < 0) newHeight = extractJsonFloat(message, "tank_height", tankHeight);
+
+    float newOn = extractJsonFloat(message, "on", -1);
+    if (newOn < 0) newOn = extractJsonFloat(message, "motor_on_percent", motorOnPercent);
+
+    float newOff = extractJsonFloat(message, "off", -1);
+    if (newOff < 0) newOff = extractJsonFloat(message, "motor_off_percent", motorOffPercent);
+
+    float newOffset = extractJsonFloat(message, "offset", -999);
+    if (newOffset == -999) newOffset = extractJsonFloat(message, "sensor_offset", sensorOffset);
 
     if (newRadius > 0 && newHeight > 0 && newOn < newOff) {
       tankRadius     = newRadius;
@@ -1012,17 +1048,17 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 
   /* --- 4. RESET USAGE COMMAND --- */
-  else if (action == "resetUsage" || message == "resetUsage") {
+  else if (action == "resetusage" || action == "reset_usage" || message == "resetUsage") {
     resetWaterUsed();
   }
 
   /* --- 5. RESET ALL COMMAND --- */
-  else if (action == "resetAll" || message == "resetAll") {
+  else if (action == "resetall" || action == "reset_all" || message == "resetAll") {
     resetAll();
   }
 
   /* --- 6. STATUS / PING REQUEST --- */
-  else if (action == "status" || action == "getStatus" || message == "status") {
+  else if (action == "status" || action == "getstatus" || message == "status") {
     publishTelemetry();
   }
 }
@@ -1391,23 +1427,41 @@ void setup() {
   Serial.print("ESP32 AP IP: ");
   Serial.println(WiFi.softAPIP());
 
-  // Connect to WiFi
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  // Connect to WiFi (Try WiFi 1 first, fallback to WiFi 2)
   Serial.print("Connecting to WiFi: ");
-  Serial.println(WIFI_SSID);
+  Serial.print(WIFI_SSID_1);
+  Serial.print(" ... ");
+  WiFi.begin(WIFI_SSID_1, WIFI_PASS_1);
 
   unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
-    delay(500);
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 5000) {
+    delay(400);
     Serial.print(".");
   }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println();
+    Serial.print("WiFi 1 not found. Trying WiFi 2: ");
+    Serial.print(WIFI_SSID_2);
+    Serial.print(" ... ");
+    WiFi.disconnect();
+    delay(200);
+    WiFi.begin(WIFI_SSID_2, WIFI_PASS_2);
+
+    start = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - start < 8000) {
+      delay(400);
+      Serial.print(".");
+    }
+  }
+
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("WiFi Connected! IP: ");
+    Serial.print(">>> WiFi Connected! IP: ");
     Serial.println(WiFi.localIP());
   } else {
-    Serial.println("WiFi Connection Timeout. Running in AP mode.");
+    Serial.println(">>> WiFi Timeout. Running in AP mode.");
   }
 
   // Setup MQTT
