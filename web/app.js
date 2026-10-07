@@ -1,26 +1,54 @@
-/* =====================================================
-   Smart Water Tank Controller - Web Frontend Logic
-   Universal MQTT Pub/Sub + Fluid Tank Animation + Optimistic Triggers
-   ===================================================== */
+/* ==========================================================================
+   AquaGuard — Next-Gen Smart Water Tank Controller (Client Logic)
+   - Real-time MQTT Pub/Sub
+   - 5–8s Statistical Rolling Window Filter (Outlier Rejection / Anti-Spike)
+   - Fluid Smooth Filling & Draining Interpolation (60 FPS)
+   - Client-side Water Volume (Liters) Calculation
+   - Smart Damping Toggle (Smoothed vs Raw Live Feed)
+   ========================================================================== */
 
+// --- TANK GEOMETRY STATE (Defaults) ---
+let tankRadius = 50.0;     // cm
+let tankHeight = 100.0;    // cm
+let sensorOffset = 0.0;    // cm
+let motorOnPercent = 25.0; // %
+let motorOffPercent = 75.0;// %
 let settingsChanged = false;
-let uiWaterPercent = 0;
-let targetWaterPercent = 0;
-let uiAnimationStarted = false;
 
-// Default MQTT Config
+// --- DAMPING & STATISTICAL BUFFER STATE ---
+const WINDOW_MS = 6000;    // 6-second rolling analysis window
+let sampleHistory = [];    // [{ timestamp, percent, dist, level }]
+let isDampingEnabled = true;
+
+// Load damping preference
+try {
+  const savedDamping = localStorage.getItem('aquaguard_damping');
+  if (savedDamping !== null) {
+    isDampingEnabled = savedDamping === 'true';
+  }
+} catch (e) {}
+
+// --- ANIMATION & WATER STATE ---
+let targetWaterPercent = 0.0;
+let currentWaterPercent = 0.0;
+let isFirstPacket = true;
+let previousWaterPercent = 0.0;
+let lastTrendCheckTime = Date.now();
+
+// --- DEFAULT MQTT CONFIGURATION ---
 const DEFAULT_CONFIG = {
-  host: window.location.hostname || '192.168.110.133',
+  host: window.location.hostname || 'www.rahat.eu.cc',
   port: window.location.protocol === 'https:' ? 443 : 9001,
-  path: window.location.protocol === 'https:' ? '/mqtt' : '/mqtt',
+  path: '/mqtt',
   user: 'rahat300809',
   pass: 'RAHAT678',
   telemetryTopic: 'devices/ESP32_WATER_01/telemetry',
   commandTopic: 'devices/ESP32_WATER_01/command'
 };
 
+// If testing locally on host, set fallback
 if (!DEFAULT_CONFIG.host || DEFAULT_CONFIG.host === 'localhost' || DEFAULT_CONFIG.host === '127.0.0.1') {
-  DEFAULT_CONFIG.host = '192.168.110.133';
+  DEFAULT_CONFIG.host = '192.168.0.104';
   DEFAULT_CONFIG.port = 9001;
   DEFAULT_CONFIG.path = '';
 }
@@ -31,26 +59,20 @@ try {
   if (saved) {
     config = { ...config, ...JSON.parse(saved) };
   }
-} catch (e) {
-  console.warn('LocalStorage error:', e);
-}
+} catch (e) {}
 
 let client = null;
-let lastTelemetryTime = 0;
-let telemetryReceived = false;
 
-/* =====================================================
-   MQTT CONNECTION
-   ===================================================== */
+/* ==========================================================================
+   MQTT CLIENT CONNECTION
+   ========================================================================== */
 
 function connectMqtt() {
   if (client) {
-    try {
-      client.end(true);
-    } catch (e) {}
+    try { client.end(true); } catch (e) {}
   }
 
-  updateMqttStatus('connecting', 'Connecting...');
+  updateMqttStatus('connecting', 'Connecting');
 
   const isSsl = window.location.protocol === 'https:' || config.port === 443;
   const protocol = isSsl ? 'wss' : 'ws';
@@ -61,9 +83,9 @@ function connectMqtt() {
   const portPart = (config.port && config.port !== 80 && config.port !== 443) ? `:${config.port}` : '';
   const brokerUrl = `${protocol}://${config.host}${portPart}${cleanPath}`;
 
-  console.log('Connecting to MQTT Broker:', brokerUrl);
+  console.log('[AquaGuard] Connecting to MQTT:', brokerUrl);
 
-  const clientId = 'web_tank_' + Math.random().toString(16).substring(2, 10);
+  const clientId = 'aquaguard_web_' + Math.random().toString(16).substring(2, 9);
   const options = {
     clientId: clientId,
     username: config.user,
@@ -78,18 +100,17 @@ function connectMqtt() {
     client = mqtt.connect(brokerUrl, options);
 
     client.on('connect', () => {
-      console.log('MQTT Connected successfully to', brokerUrl);
-      updateMqttStatus('connected', 'MQTT Connected');
+      console.log('[AquaGuard] Connected successfully to', brokerUrl);
+      updateMqttStatus('connected', 'Online');
       showToast('Connected to MQTT Broker', 'success');
 
       // Subscribe to telemetry topic
       client.subscribe(config.telemetryTopic, { qos: 0 }, (err) => {
         if (err) {
-          console.error('Subscription error:', err);
+          console.error('[AquaGuard] Subscription error:', err);
           showToast('Failed to subscribe to telemetry', 'error');
         } else {
-          console.log('Subscribed to:', config.telemetryTopic);
-          // Send request for status
+          // Request instant status
           sendCommand({ command: 'STATUS', action: 'status' });
         }
       });
@@ -98,24 +119,21 @@ function connectMqtt() {
     client.on('message', (topic, payload) => {
       if (topic === config.telemetryTopic) {
         try {
-          const rawStr = payload.toString();
-          const data = JSON.parse(rawStr);
-          lastTelemetryTime = Date.now();
-          telemetryReceived = true;
-          applyTelemetry(data);
+          const data = JSON.parse(payload.toString());
+          processIncomingTelemetry(data);
         } catch (err) {
-          console.error('Invalid telemetry JSON:', err, payload.toString());
+          console.error('[AquaGuard] Invalid JSON telemetry:', err);
         }
       }
     });
 
     client.on('error', (err) => {
-      console.error('MQTT Client Error:', err);
-      updateMqttStatus('disconnected', 'MQTT Error');
+      console.error('[AquaGuard] Client error:', err);
+      updateMqttStatus('disconnected', 'Error');
     });
 
     client.on('close', () => {
-      updateMqttStatus('disconnected', 'Disconnected');
+      updateMqttStatus('disconnected', 'Offline');
     });
 
     client.on('offline', () => {
@@ -123,250 +141,407 @@ function connectMqtt() {
     });
 
     client.on('reconnect', () => {
-      updateMqttStatus('connecting', 'Reconnecting...');
+      updateMqttStatus('connecting', 'Reconnecting');
     });
 
   } catch (err) {
-    console.error('MQTT setup failed:', err);
-    updateMqttStatus('disconnected', 'Connection Failed');
+    console.error('[AquaGuard] Setup exception:', err);
+    updateMqttStatus('disconnected', 'Failed');
   }
 }
 
 function updateMqttStatus(statusClass, label) {
   const badge = document.getElementById('mqttBadge');
   const text = document.getElementById('mqttStatusText');
-  if (badge) {
-    badge.className = `mqtt-badge ${statusClass}`;
-  }
-  if (text) {
-    text.innerText = label;
-  }
+  if (badge) badge.className = `status-pill ${statusClass}`;
+  if (text) text.innerText = label;
 }
-
-/* =====================================================
-   COMMAND PUBLISHER (UNIVERSAL FORMAT)
-   ===================================================== */
 
 function sendCommand(cmdObj) {
   if (!client || !client.connected) {
-    showToast('MQTT not connected! Please check connection.', 'error');
+    showToast('MQTT not connected. Check broker settings.', 'error');
     return false;
   }
-
   const payload = JSON.stringify(cmdObj);
   client.publish(config.commandTopic, payload, { qos: 0 }, (err) => {
     if (err) {
-      console.error('Command publish failed:', err);
+      console.error('[AquaGuard] Publish error:', err);
       showToast('Failed to send command', 'error');
-    } else {
-      console.log('Command sent to', config.commandTopic, ':', payload);
     }
   });
   return true;
 }
 
-/* =====================================================
-   DATA TELEMETRY HANDLER
-   Supports both standard and alternative JSON keys
-   ===================================================== */
+/* ==========================================================================
+   ANTI-SPIKE STATISTICAL FILTER & TELEMETRY PROCESSOR
+   ========================================================================== */
 
-function applyTelemetry(d) {
-  // Extract percent (support .percent or .water_percent)
-  const percentVal = d.percent !== undefined ? d.percent : d.water_percent;
-  if (percentVal !== undefined && percentVal !== null) {
-    targetWaterPercent = parseFloat(percentVal);
-    if (!uiAnimationStarted) {
-      uiWaterPercent = targetWaterPercent;
-      uiAnimationStarted = true;
+function processIncomingTelemetry(d) {
+  const now = Date.now();
+
+  // Extract raw percent
+  const rawPercent = d.percent !== undefined ? parseFloat(d.percent) : (d.water_percent !== undefined ? parseFloat(d.water_percent) : 0);
+  const rawDist = d.distance !== undefined ? parseFloat(d.distance) : (d.raw_distance !== undefined ? parseFloat(d.raw_distance) : 0);
+  const rawLevel = d.level !== undefined ? parseFloat(d.level) : (d.water_level !== undefined ? parseFloat(d.water_level) : 0);
+
+  // Store into rolling statistical window
+  sampleHistory.push({
+    timestamp: now,
+    percent: rawPercent,
+    dist: rawDist,
+    level: rawLevel
+  });
+
+  // Prune points older than WINDOW_MS
+  sampleHistory = sampleHistory.filter(s => s.timestamp >= now - WINDOW_MS);
+
+  // Determine target water percentage
+  if (isDampingEnabled) {
+    // 1. OUTLIER REJECTION & DOMINANT CLUSTER MEAN
+    const sorted = sampleHistory.map(s => s.percent).sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    const median = sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+
+    // Tolerance band: Keep samples within +/- 12% of median (reject sudden 1-sample spikes)
+    const cluster = sorted.filter(val => Math.abs(val - median) <= 12.0);
+    const robustCluster = cluster.length > 0 ? cluster : sorted;
+    
+    // Average of the dominant cluster
+    const clusterMean = robustCluster.reduce((sum, v) => sum + v, 0) / robustCluster.length;
+    targetWaterPercent = clusterMean;
+  } else {
+    // Raw live feed: instant 1:1
+    targetWaterPercent = rawPercent;
+    currentWaterPercent = rawPercent; // instantaneous jump if damping disabled
+  }
+
+  // First packet init
+  if (isFirstPacket) {
+    currentWaterPercent = targetWaterPercent;
+    isFirstPacket = false;
+  }
+
+  // Update Tank Dimensions (if sent from controller & user not editing)
+  if (!settingsChanged) {
+    if (d.radius !== undefined || d.tank_radius !== undefined) {
+      tankRadius = parseFloat(d.radius || d.tank_radius);
+      const radEl = document.getElementById('radius');
+      if (radEl) radEl.value = tankRadius;
+    }
+    if (d.height !== undefined || d.tank_height !== undefined) {
+      tankHeight = parseFloat(d.height || d.tank_height);
+      const hEl = document.getElementById('height');
+      if (hEl) hEl.value = tankHeight;
+    }
+    if (d.on !== undefined || d.motor_on_percent !== undefined) {
+      motorOnPercent = parseFloat(d.on || d.motor_on_percent);
+      const onEl = document.getElementById('on');
+      if (onEl) onEl.value = motorOnPercent;
+    }
+    if (d.off !== undefined || d.motor_off_percent !== undefined) {
+      motorOffPercent = parseFloat(d.off || d.motor_off_percent);
+      const offEl = document.getElementById('off');
+      if (offEl) offEl.value = motorOffPercent;
+    }
+    if (d.offset !== undefined || d.sensor_offset !== undefined) {
+      sensorOffset = parseFloat(d.offset || d.sensor_offset);
+      const offEl = document.getElementById('offset');
+      if (offEl) offEl.value = sensorOffset;
     }
   }
 
-  // Stats Grid
-  const distVal = d.distance !== undefined ? d.distance : (d.raw_distance !== undefined ? d.raw_distance : null);
-  if (distVal !== null) document.getElementById('distance').innerText = Number(distVal).toFixed(2);
+  // Update secondary metrics
+  const distEl = document.getElementById('distDisplay');
+  if (distEl) distEl.innerText = rawDist.toFixed(1);
 
-  const levelVal = d.level !== undefined ? d.level : d.water_level;
-  if (levelVal !== undefined) document.getElementById('level').innerText = Number(levelVal).toFixed(2);
-
-  const litersVal = d.liters !== undefined ? d.liters : d.water_liters;
-  if (litersVal !== undefined) document.getElementById('liters').innerText = Number(litersVal).toFixed(2);
-
-  const capVal = d.capacity !== undefined ? d.capacity : d.tank_capacity;
-  if (capVal !== undefined) document.getElementById('capacity').innerText = Number(capVal).toFixed(2);
-
+  const usedEl = document.getElementById('usedDisplay');
   const usedVal = d.used !== undefined ? d.used : d.water_used;
-  if (usedVal !== undefined) document.getElementById('used').innerText = Number(usedVal).toFixed(2);
+  if (usedEl && usedVal !== undefined) usedEl.innerText = Number(usedVal).toFixed(1);
 
   // Motor Status & Mode
   const isRelayOn = d.relay === true || d.relay === 'true' || d.motor === true || d.motor === 'true' || d.motor_state === 'ON';
-  const motorStatusEl = document.getElementById('motorStatus');
-  if (motorStatusEl) {
-    motorStatusEl.innerText = isRelayOn ? 'ON' : 'OFF';
-    motorStatusEl.className = 'motor-status ' + (isRelayOn ? 'motor-on' : 'motor-off');
-  }
+  updateMotorVisuals(isRelayOn, d.mode || d.motor_mode || 'AUTO');
 
-  const modeVal = d.mode || d.motor_mode;
-  if (modeVal) {
-    document.getElementById('motorMode').innerText = modeVal.toUpperCase();
-  }
-
-  // System State & Countdowns
-  const stateEl = document.getElementById('systemState');
-  const countdownEl = document.getElementById('countdown');
-  const state = d.state || d.system_state || 'NORMAL';
-
-  if (stateEl) {
-    stateEl.innerText = state;
-    stateEl.className = 'notice';
-
-    if (state === 'NORMAL') {
-      if (countdownEl) countdownEl.innerText = 'System stable • Telemetry active';
-    } else if (state === 'VERIFY_ON') {
-      stateEl.classList.add('verify-on');
-      if (countdownEl) countdownEl.innerText = `🔎 Confirming MOTOR ON — ${d.remaining || 0}s remaining`;
-    } else if (state === 'VERIFY_OFF') {
-      stateEl.classList.add('verify-off');
-      if (countdownEl) countdownEl.innerText = `🔎 Confirming MOTOR OFF — ${d.remaining || 0}s remaining`;
-    } else if (state === 'CALIBRATING') {
-      stateEl.classList.add('calibrating');
-      if (countdownEl) countdownEl.innerText = `⏳ Calibration — ${d.remaining || 0}s remaining`;
-    }
-  }
-
-  // Motor Thresholds
-  const onVal = d.on !== undefined ? d.on : d.motor_on_percent;
-  if (onVal !== undefined) document.getElementById('onDisplay').innerText = Number(onVal).toFixed(1);
-
-  const offVal = d.off !== undefined ? d.off : d.motor_off_percent;
-  if (offVal !== undefined) document.getElementById('offDisplay').innerText = Number(offVal).toFixed(1);
+  // Verification & Countdown State
+  updateSystemStateBanner(d);
 
   // Calibration Info
-  const emptyVal = d.empty !== undefined ? d.empty : d.empty_distance;
-  if (emptyVal !== undefined) document.getElementById('empty').innerText = Number(emptyVal).toFixed(2);
+  updateCalibrationUI(d);
+}
 
-  const fullVal = d.full !== undefined ? d.full : d.full_distance;
-  if (fullVal !== undefined) document.getElementById('full').innerText = Number(fullVal).toFixed(2);
+/* ==========================================================================
+   FLUID LIQUID SIMULATION & DYNAMIC LITERS ENGINE (60 FPS)
+   ========================================================================== */
 
-  const isCalibrated = d.calibrated === true || d.calibrated === 'true';
-  const calBadge = document.getElementById('calibrated');
-  if (calBadge) {
-    calBadge.innerText = isCalibrated ? 'YES' : 'NO';
-    calBadge.style.color = isCalibrated ? 'var(--success)' : 'var(--danger)';
+function fluidLoop() {
+  // Smoothly interpolate currentWaterPercent towards targetWaterPercent
+  if (isDampingEnabled) {
+    const diff = targetWaterPercent - currentWaterPercent;
+    if (Math.abs(diff) > 0.05) {
+      // Gentle spring ease: faster for large jumps, gentle for small ripples
+      const rate = Math.abs(diff) > 20 ? 0.04 : (Math.abs(diff) > 5 ? 0.03 : 0.02);
+      currentWaterPercent += diff * rate;
+    } else {
+      currentWaterPercent = targetWaterPercent;
+    }
+  } else {
+    currentWaterPercent = targetWaterPercent;
   }
 
-  // Calibration progress
-  const isCalRunning = d.calibrationRunning === true || d.calibrationRunning === 'true' || d.calibration_running === true || d.calibration_running === 'true';
-  const calNoticeEl = document.getElementById('calNotice');
-  const calBarEl = document.getElementById('calBar');
-  const calTimerEl = document.getElementById('calTimer');
+  // Constrain bounds [0, 100]
+  if (currentWaterPercent < 0) currentWaterPercent = 0;
+  if (currentWaterPercent > 100) currentWaterPercent = 100;
+
+  // --- DYNAMIC WATER LITERS & HEIGHT CALCULATION ---
+  // Capacity = (pi * r^2 * h) / 1000 Liters
+  const tankCapacityLiters = (Math.PI * Math.pow(tankRadius, 2) * tankHeight) / 1000.0;
+  const currentLiters = tankCapacityLiters * (currentWaterPercent / 100.0);
+  const currentDepthCm = tankHeight * (currentWaterPercent / 100.0);
+
+  // Update UI Elements
+  const percentEl = document.getElementById('waterPercentDisplay');
+  if (percentEl) percentEl.innerText = currentWaterPercent.toFixed(1);
+
+  const litersEl = document.getElementById('litersCalculated');
+  if (litersEl) litersEl.innerText = currentLiters.toFixed(1);
+
+  const capacityEl = document.getElementById('capacityTotal');
+  if (capacityEl) capacityEl.innerText = tankCapacityLiters.toFixed(1);
+
+  const levelEl = document.getElementById('levelDisplay');
+  if (levelEl) levelEl.innerText = currentDepthCm.toFixed(1);
+
+  // Update Realistic Water Height
+  const waterBody = document.getElementById('waterBody');
+  if (waterBody) waterBody.style.height = `${currentWaterPercent}%`;
+
+  // Update Trend Badge every 2 seconds
+  const now = Date.now();
+  if (now - lastTrendCheckTime >= 2000) {
+    lastTrendCheckTime = now;
+    const delta = currentWaterPercent - previousWaterPercent;
+    previousWaterPercent = currentWaterPercent;
+
+    const trendText = document.getElementById('trendText');
+    const trendBadge = document.getElementById('trendBadge');
+    const inflowStream = document.getElementById('inflowStream');
+
+    if (delta > 0.4) {
+      if (trendText) trendText.innerText = 'Filling';
+      if (trendBadge) trendBadge.innerHTML = '<span class="trend-icon">🟢</span> Filling';
+      if (inflowStream) inflowStream.classList.add('flowing');
+    } else if (delta < -0.4) {
+      if (trendText) trendText.innerText = 'Draining';
+      if (trendBadge) trendBadge.innerHTML = '<span class="trend-icon">🔻</span> Draining';
+      if (inflowStream) inflowStream.classList.remove('flowing');
+    } else {
+      if (trendText) trendText.innerText = 'Stable';
+      if (trendBadge) trendBadge.innerHTML = '<span class="trend-icon">⚪</span> Stable';
+      if (inflowStream && !isMotorActive) inflowStream.classList.remove('flowing');
+    }
+  }
+
+  requestAnimationFrame(fluidLoop);
+}
+
+// Start 60fps fluid simulation loop
+requestAnimationFrame(fluidLoop);
+
+/* ==========================================================================
+   MOTOR CONTROLS & VISUALS
+   ========================================================================== */
+
+let isMotorActive = false;
+
+function updateMotorVisuals(isOn, mode) {
+  isMotorActive = isOn;
+  const statusBadge = document.getElementById('motorStatusBadge');
+  const pumpIcon = document.getElementById('pumpIcon');
+  const modeBadge = document.getElementById('motorModeBadge');
+  const inflowStream = document.getElementById('inflowStream');
+
+  if (statusBadge) {
+    statusBadge.innerText = isOn ? 'PUMP RUNNING' : 'PUMP OFF';
+    statusBadge.className = `motor-state-text ${isOn ? 'on' : 'off'}`;
+  }
+
+  if (pumpIcon) {
+    if (isOn) {
+      pumpIcon.classList.add('pumping');
+    } else {
+      pumpIcon.classList.remove('pumping');
+    }
+  }
+
+  if (modeBadge) {
+    modeBadge.innerText = (mode || 'AUTO').toUpperCase();
+  }
+
+  // Animate water pouring into tank if pump is running
+  if (inflowStream) {
+    if (isOn) {
+      inflowStream.classList.add('flowing');
+    } else if (Math.abs(targetWaterPercent - currentWaterPercent) <= 0.1) {
+      inflowStream.classList.remove('flowing');
+    }
+  }
+}
+
+function sendMotorCommand(action) {
+  let payload = {};
+  if (action === 'on') {
+    payload = { command: 'MOTOR', value: 'ON', action: 'motor', state: 'on' };
+    updateMotorVisuals(true, 'MANUAL');
+    showToast('Sent: Manual Motor ON', 'info');
+  } else if (action === 'off') {
+    payload = { command: 'MOTOR', value: 'OFF', action: 'motor', state: 'off' };
+    updateMotorVisuals(false, 'MANUAL');
+    showToast('Sent: Manual Motor OFF', 'info');
+  } else if (action === 'auto') {
+    payload = { command: 'MODE', value: 'AUTO', action: 'motor', state: 'auto' };
+    const modeBadge = document.getElementById('motorModeBadge');
+    if (modeBadge) modeBadge.innerText = 'AUTO';
+    showToast('Sent: Mode AUTO', 'info');
+  }
+
+  sendCommand(payload);
+}
+
+/* ==========================================================================
+   SYSTEM STATE & COUNTDOWN NOTICES
+   ========================================================================== */
+
+function updateSystemStateBanner(d) {
+  const banner = document.getElementById('countdownBanner');
+  const text = document.getElementById('countdownText');
+  const stateBadge = document.getElementById('tankStateBadge');
+  const state = d.state || d.system_state || 'NORMAL';
+
+  if (!banner || !text) return;
+
+  if (stateBadge) stateBadge.innerText = state;
+
+  if (state === 'NORMAL') {
+    banner.className = 'system-status-banner normal';
+    text.innerText = 'System Stable • Live Monitoring Active';
+  } else if (state === 'VERIFY_ON') {
+    banner.className = 'system-status-banner verify-on';
+    text.innerText = `⏳ Confirming LOW WATER ON: ${d.remaining || 0}s remaining`;
+  } else if (state === 'VERIFY_OFF') {
+    banner.className = 'system-status-banner verify-off';
+    text.innerText = `⏳ Confirming HIGH WATER OFF: ${d.remaining || 0}s remaining`;
+  } else if (state === 'CALIBRATING') {
+    banner.className = 'system-status-banner calibrating';
+    text.innerText = `🎯 Calibration Active: ${d.remaining || 0}s remaining`;
+  }
+}
+
+function updateCalibrationUI(d) {
+  const isCalRunning = d.calibrationRunning === true || d.calibrationRunning === 'true' || d.calibration_running === true;
+  const isCalibrated = d.calibrated === true || d.calibrated === 'true';
+
+  const notice = document.getElementById('calNotice');
+  const bar = document.getElementById('calBar');
+  const timer = document.getElementById('calTimer');
+  const calStatus = document.getElementById('calibratedStatus');
+
+  if (calStatus) {
+    calStatus.innerText = isCalibrated ? 'CALIBRATED' : 'NOT READY';
+    calStatus.style.color = isCalibrated ? 'var(--success)' : 'var(--danger)';
+  }
 
   if (isCalRunning) {
-    if (calNoticeEl) calNoticeEl.innerText = `⏳ KEEP TANK STEADY — ${d.remaining || 0}s remaining`;
-    if (calBarEl) calBarEl.style.width = (d.progress || 0) + '%';
-    if (calTimerEl) calTimerEl.innerText = `${d.remaining || 0} seconds`;
+    if (notice) notice.innerText = `KEEP SENSOR STEADY — ${d.remaining || 0}s remaining`;
+    if (bar) bar.style.width = (d.progress || 0) + '%';
+    if (timer) timer.innerText = `${d.remaining || 0}s remaining`;
   } else {
-    if (calNoticeEl) calNoticeEl.innerText = isCalibrated ? 'Calibration ready' : 'Keep tank steady before calibration.';
-    if (calBarEl) calBarEl.style.width = '0%';
-    if (calTimerEl) calTimerEl.innerText = 'Ready';
+    if (notice) notice.innerText = isCalibrated ? 'Sensor calibrated and saved in EEPROM.' : 'Keep tank steady before starting 10-second calibration.';
+    if (bar) bar.style.width = '0%';
+    if (timer) timer.innerText = 'Ready';
   }
 
-  // Form Fields (Prevent overwriting if user is typing)
-  if (!settingsChanged) {
-    const radVal = d.radius !== undefined ? d.radius : d.tank_radius;
-    if (radVal !== undefined) document.getElementById('radius').value = radVal;
+  const emptyVal = d.empty !== undefined ? d.empty : d.empty_distance;
+  if (emptyVal !== undefined) {
+    const el = document.getElementById('emptyDist');
+    if (el) el.innerText = `${Number(emptyVal).toFixed(2)} cm`;
+  }
 
-    const hVal = d.height !== undefined ? d.height : d.tank_height;
-    if (hVal !== undefined) document.getElementById('height').value = hVal;
-
-    if (onVal !== undefined) document.getElementById('on').value = onVal;
-    if (offVal !== undefined) document.getElementById('off').value = offVal;
-
-    const offsetVal = d.offset !== undefined ? d.offset : d.sensor_offset;
-    if (offsetVal !== undefined) document.getElementById('offset').value = offsetVal;
+  const fullVal = d.full !== undefined ? d.full : d.full_distance;
+  if (fullVal !== undefined) {
+    const el = document.getElementById('fullDist');
+    if (el) el.innerText = `${Number(fullVal).toFixed(2)} cm`;
   }
 }
 
-/* =====================================================
-   FLUID WATER ANIMATION (20 FPS)
-   ===================================================== */
+/* ==========================================================================
+   SMART DAMPING TOGGLE HANDLER
+   ========================================================================== */
 
-function animateWater() {
-  let difference = targetWaterPercent - uiWaterPercent;
+const dampingToggle = document.getElementById('dampingToggle');
+const dampingBadge = document.getElementById('dampingBadge');
 
-  if (Math.abs(difference) > 20) {
-    uiWaterPercent += difference * 0.08;
-  } else if (Math.abs(difference) > 10) {
-    uiWaterPercent += difference * 0.06;
-  } else if (Math.abs(difference) > 3) {
-    uiWaterPercent += difference * 0.04;
-  } else {
-    uiWaterPercent += difference * 0.025;
-  }
+if (dampingToggle) {
+  dampingToggle.checked = isDampingEnabled;
+  updateDampingBadge(isDampingEnabled);
 
-  if (Math.abs(targetWaterPercent - uiWaterPercent) < 0.05) {
-    uiWaterPercent = targetWaterPercent;
-  }
+  dampingToggle.addEventListener('change', (e) => {
+    isDampingEnabled = e.target.checked;
+    updateDampingBadge(isDampingEnabled);
+    try {
+      localStorage.setItem('aquaguard_damping', isDampingEnabled ? 'true' : 'false');
+    } catch (err) {}
 
-  if (uiWaterPercent < 0) uiWaterPercent = 0;
-  if (uiWaterPercent > 100) uiWaterPercent = 100;
-
-  const waterEl = document.getElementById('water');
-  const textEl = document.getElementById('waterText');
-
-  if (waterEl) waterEl.style.height = uiWaterPercent + '%';
-  if (textEl) textEl.innerText = uiWaterPercent.toFixed(1) + '%';
+    showToast(isDampingEnabled ? 'Smart Anti-Spike Damping Enabled' : 'Raw Live Feed Enabled (Immediate Update)', 'info');
+  });
 }
 
-setInterval(animateWater, 50);
-
-/* =====================================================
-   USER TRIGGER ACTIONS (OPTIMISTIC + DUAL SCHEMA)
-   ===================================================== */
-
-function sendMotorCommand(state) {
-  const motorStatusEl = document.getElementById('motorStatus');
-  const motorModeEl = document.getElementById('motorMode');
-
-  // Universal payload that matches both sketch versions
-  let payload = {};
-  if (state === 'on') {
-    payload = {
-      command: 'MOTOR',
-      value: 'ON',
-      action: 'motor',
-      state: 'on'
-    };
-    // Optimistic UI update
-    if (motorStatusEl) {
-      motorStatusEl.innerText = 'ON';
-      motorStatusEl.className = 'motor-status motor-on';
-    }
-    if (motorModeEl) motorModeEl.innerText = 'MANUAL';
-  } else if (state === 'off') {
-    payload = {
-      command: 'MOTOR',
-      value: 'OFF',
-      action: 'motor',
-      state: 'off'
-    };
-    if (motorStatusEl) {
-      motorStatusEl.innerText = 'OFF';
-      motorStatusEl.className = 'motor-status motor-off';
-    }
-    if (motorModeEl) motorModeEl.innerText = 'MANUAL';
-  } else if (state === 'auto') {
-    payload = {
-      command: 'MODE',
-      value: 'AUTO',
-      action: 'motor',
-      state: 'auto'
-    };
-    if (motorModeEl) motorModeEl.innerText = 'AUTO';
+function updateDampingBadge(enabled) {
+  if (!dampingBadge) return;
+  if (enabled) {
+    dampingBadge.innerText = 'SMOOTHED';
+    dampingBadge.className = 'mode-pill active';
+  } else {
+    dampingBadge.innerText = 'RAW LIVE';
+    dampingBadge.className = 'mode-pill raw';
   }
+}
 
-  if (sendCommand(payload)) {
-    showToast(`Trigger sent: Motor ${state.toUpperCase()}`, 'info');
-  }
+/* ==========================================================================
+   SETTINGS MODAL & TABS LOGIC
+   ========================================================================== */
+
+document.getElementById('settingsBtn').addEventListener('click', () => {
+  document.getElementById('mqttHost').value = config.host;
+  document.getElementById('mqttPort').value = config.port;
+  document.getElementById('mqttPath').value = config.path;
+  document.getElementById('mqttUser').value = config.user;
+  document.getElementById('mqttPass').value = config.pass;
+  document.getElementById('mqttTelemetryTopic').value = config.telemetryTopic;
+  document.getElementById('mqttCommandTopic').value = config.commandTopic;
+
+  document.getElementById('settingsModal').classList.add('open');
+});
+
+function closeSettingsModal() {
+  document.getElementById('settingsModal').classList.remove('open');
+}
+
+// Close when clicking outside sheet
+document.getElementById('settingsModal').addEventListener('click', (e) => {
+  if (e.target.id === 'settingsModal') closeSettingsModal();
+});
+
+function switchTab(tabId) {
+  document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+
+  const activeContent = document.getElementById(tabId);
+  if (activeContent) activeContent.classList.add('active');
+
+  const buttons = document.querySelectorAll('.tab-btn');
+  if (tabId === 'tabTank' && buttons[0]) buttons[0].classList.add('active');
+  if (tabId === 'tabCalib' && buttons[1]) buttons[1].classList.add('active');
+  if (tabId === 'tabMqtt' && buttons[2]) buttons[2].classList.add('active');
 }
 
 function saveSettings() {
@@ -377,7 +552,7 @@ function saveSettings() {
   const offset = parseFloat(document.getElementById('offset').value) || 0;
 
   if (isNaN(radius) || radius <= 0 || isNaN(height) || height <= 0) {
-    alert('Invalid tank dimensions! Radius and Height must be positive numbers.');
+    alert('Invalid tank dimensions! Radius and Height must be positive.');
     return;
   }
 
@@ -386,7 +561,12 @@ function saveSettings() {
     return;
   }
 
-  // Universal payload
+  tankRadius = radius;
+  tankHeight = height;
+  motorOnPercent = on;
+  motorOffPercent = off;
+  sensorOffset = offset;
+
   const payload = {
     command: 'SETTINGS',
     action: 'save',
@@ -404,81 +584,9 @@ function saveSettings() {
 
   if (sendCommand(payload)) {
     settingsChanged = false;
-    document.getElementById('onDisplay').innerText = on.toFixed(1);
-    document.getElementById('offDisplay').innerText = off.toFixed(1);
-    showToast('Settings saved & sent to ESP32', 'success');
+    showToast('Settings saved & applied', 'success');
+    closeSettingsModal();
   }
-}
-
-function calibrate(type) {
-  if (!confirm(`Keep the tank completely steady for 10 seconds. Start ${type.toUpperCase()} calibration?`)) {
-    return;
-  }
-
-  const payload = {
-    command: 'CALIBRATE',
-    type: type,
-    action: 'calibrate'
-  };
-
-  if (sendCommand(payload)) {
-    showToast(`Starting ${type} calibration`, 'info');
-  }
-}
-
-function resetUsage() {
-  if (!confirm('Reset total water usage to 0?')) {
-    return;
-  }
-
-  const payload = {
-    command: 'RESET_USAGE',
-    action: 'resetUsage'
-  };
-
-  if (sendCommand(payload)) {
-    document.getElementById('used').innerText = '0.00';
-    showToast('Water usage reset sent', 'info');
-  }
-}
-
-function resetAll() {
-  if (!confirm('Reset ALL settings, calibration data, and water usage to defaults?')) {
-    return;
-  }
-
-  const payload = {
-    command: 'RESET_ALL',
-    action: 'resetAll'
-  };
-
-  if (sendCommand(payload)) {
-    settingsChanged = false;
-    uiWaterPercent = 0;
-    targetWaterPercent = 0;
-    uiAnimationStarted = false;
-    showToast('All settings reset sent to ESP32', 'warning');
-  }
-}
-
-/* =====================================================
-   SETTINGS MODAL & PERSISTENCE
-   ===================================================== */
-
-document.getElementById('settingsBtn').addEventListener('click', () => {
-  document.getElementById('mqttHost').value = config.host;
-  document.getElementById('mqttPort').value = config.port;
-  document.getElementById('mqttPath').value = config.path;
-  document.getElementById('mqttUser').value = config.user;
-  document.getElementById('mqttPass').value = config.pass;
-  document.getElementById('mqttTelemetryTopic').value = config.telemetryTopic;
-  document.getElementById('mqttCommandTopic').value = config.commandTopic;
-
-  document.getElementById('settingsModal').classList.add('open');
-});
-
-function closeSettingsModal() {
-  document.getElementById('settingsModal').classList.remove('open');
 }
 
 function saveMqttConfig() {
@@ -499,19 +607,52 @@ function saveMqttConfig() {
   connectMqtt();
 }
 
-/* =====================================================
-   TOAST NOTIFICATION HELPER
-   ===================================================== */
+function calibrate(type) {
+  if (!confirm(`Keep the sensor steady over the ${type.toUpperCase()} position for 10 seconds. Start calibration?`)) {
+    return;
+  }
+
+  const payload = {
+    command: 'CALIBRATE',
+    type: type,
+    action: 'calibrate'
+  };
+
+  if (sendCommand(payload)) {
+    showToast(`Starting ${type} calibration...`, 'info');
+    closeSettingsModal();
+  }
+}
+
+function resetUsage() {
+  if (!confirm('Reset total cumulative water usage back to 0 Liters?')) return;
+  const payload = { command: 'RESET_USAGE', action: 'resetUsage' };
+  if (sendCommand(payload)) {
+    showToast('Water usage reset sent', 'info');
+  }
+}
+
+function resetAll() {
+  if (!confirm('Reset ALL settings and calibrations to factory default?')) return;
+  const payload = { command: 'RESET_ALL', action: 'resetAll' };
+  if (sendCommand(payload)) {
+    showToast('Factory reset command sent', 'warning');
+    closeSettingsModal();
+  }
+}
+
+/* ==========================================================================
+   TOAST HELPER
+   ========================================================================== */
 
 function showToast(message, type = 'info') {
-  const container = document.getElementById('toastContainer');
-  if (!container) return;
+  const hub = document.getElementById('toastContainer');
+  if (!hub) return;
 
   const toast = document.createElement('div');
   toast.className = `toast toast-${type}`;
   toast.innerText = message;
-
-  container.appendChild(toast);
+  hub.appendChild(toast);
 
   setTimeout(() => {
     toast.style.opacity = '0';
@@ -520,7 +661,7 @@ function showToast(message, type = 'info') {
   }, 3500);
 }
 
-// Start connection on load
+// Start MQTT on DOM load
 window.addEventListener('DOMContentLoaded', () => {
   connectMqtt();
 });
