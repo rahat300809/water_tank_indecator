@@ -35,6 +35,22 @@ let isFirstPacket = true;
 let previousWaterPercent = 0.0;
 let lastTrendCheckTime = Date.now();
 
+// --- WATER USAGE STATE (Discrete Motor Cycle Calculation) ---
+let totalAccumulatedUsedLiters = 0.0;
+let fullBaselinePercent = null;
+let previousMotorRunning = null;
+
+try {
+  const savedUsed = localStorage.getItem('aquaguard_accumulated_used');
+  if (savedUsed !== null) {
+    totalAccumulatedUsedLiters = parseFloat(savedUsed) || 0.0;
+  }
+  const savedBaseline = localStorage.getItem('aquaguard_full_baseline');
+  if (savedBaseline !== null) {
+    fullBaselinePercent = parseFloat(savedBaseline);
+  }
+} catch (e) {}
+
 // --- DEFAULT MQTT CONFIGURATION ---
 const DEFAULT_CONFIG = {
   host: window.location.hostname || 'www.rahat.eu.cc',
@@ -265,13 +281,10 @@ function processIncomingTelemetry(d) {
   const rawMiniEl = document.getElementById('rawHeightMini');
   if (rawMiniEl) rawMiniEl.innerText = rawLevel.toFixed(1);
 
-  const usedEl = document.getElementById('usedDisplay');
-  const usedVal = d.used !== undefined ? d.used : d.water_used;
-  if (usedEl && usedVal !== undefined) usedEl.innerText = Number(usedVal).toFixed(1);
-
-  // Motor Status & Mode
+  // Motor Status & Mode (Strictly drives filling stream animation & water usage cycle)
   const isRelayOn = d.relay === true || d.relay === 'true' || d.motor === true || d.motor === 'true' || d.motor_state === 'ON';
   updateMotorVisuals(isRelayOn, d.mode || d.motor_mode || 'AUTO');
+  updateWaterUsage(isRelayOn, currentWaterPercent);
 
   // Verification & Countdown State
   updateSystemStateBanner(d);
@@ -326,6 +339,9 @@ function fluidLoop() {
   const waterBody = document.getElementById('waterBody');
   if (waterBody) waterBody.style.height = `${currentWaterPercent}%`;
 
+  // Update Water Usage Liters (Strictly discrete cycle & geometry based)
+  updateWaterUsage(isMotorActive, currentWaterPercent);
+
   // Update Trend Badge every 2 seconds
   const now = Date.now();
   if (now - lastTrendCheckTime >= 2000) {
@@ -335,20 +351,16 @@ function fluidLoop() {
 
     const trendText = document.getElementById('trendText');
     const trendBadge = document.getElementById('trendBadge');
-    const inflowStream = document.getElementById('inflowStream');
 
-    if (delta > 0.4) {
+    if (isMotorActive || delta > 0.4) {
       if (trendText) trendText.innerText = 'Filling';
       if (trendBadge) trendBadge.innerHTML = '<span class="trend-icon">🟢</span> Filling';
-      if (inflowStream) inflowStream.classList.add('flowing');
     } else if (delta < -0.4) {
       if (trendText) trendText.innerText = 'Draining';
       if (trendBadge) trendBadge.innerHTML = '<span class="trend-icon">🔻</span> Draining';
-      if (inflowStream) inflowStream.classList.remove('flowing');
     } else {
       if (trendText) trendText.innerText = 'Stable';
       if (trendBadge) trendBadge.innerHTML = '<span class="trend-icon">⚪</span> Stable';
-      if (inflowStream && !isMotorActive) inflowStream.classList.remove('flowing');
     }
   }
 
@@ -357,6 +369,81 @@ function fluidLoop() {
 
 // Start 60fps fluid simulation loop
 requestAnimationFrame(fluidLoop);
+
+/* ==========================================================================
+   WATER USAGE CALCULATION ENGINE (DISCRETE CYCLES & GEOMETRY)
+   - Calculated with Tank Radius, Height, and Water Percentage
+   - Discrete Motor ON / OFF cycles (NO continuous sensor jitter summation)
+   ========================================================================== */
+
+function updateWaterUsage(isMotorRunning, currentPercent) {
+  if (tankRadius <= 0 || tankHeight <= 0 || isNaN(currentPercent) || currentPercent <= 0) {
+    return totalAccumulatedUsedLiters;
+  }
+
+  // Tank Capacity: V = (π * r² * h) / 1000 Liters
+  const tankCapacityLiters = (Math.PI * Math.pow(tankRadius, 2) * tankHeight) / 1000.0;
+
+  // Discrete Cycle Transition Detection
+  if (previousMotorRunning !== null) {
+    // 1. Motor was RUNNING -> now turned OFF (Tank reached peak fill level)
+    if (previousMotorRunning && !isMotorRunning) {
+      fullBaselinePercent = currentPercent;
+      try {
+        localStorage.setItem('aquaguard_full_baseline', fullBaselinePercent.toString());
+      } catch (e) {}
+    }
+    // 2. Motor was OFF -> now turned ON (Refill started, lock consumption of completed cycle)
+    else if (!previousMotorRunning && isMotorRunning) {
+      if (fullBaselinePercent !== null && fullBaselinePercent > currentPercent) {
+        const cycleConsumedLiters = tankCapacityLiters * ((fullBaselinePercent - currentPercent) / 100.0);
+        if (cycleConsumedLiters > 0) {
+          totalAccumulatedUsedLiters += cycleConsumedLiters;
+          try {
+            localStorage.setItem('aquaguard_accumulated_used', totalAccumulatedUsedLiters.toString());
+          } catch (e) {}
+        }
+      }
+      fullBaselinePercent = null;
+      try {
+        localStorage.removeItem('aquaguard_full_baseline');
+      } catch (e) {}
+    }
+  } else {
+    // Initial startup: anchor baseline to current level if motor is off
+    if (!isMotorRunning && fullBaselinePercent === null && currentPercent > 0) {
+      fullBaselinePercent = currentPercent;
+      try {
+        localStorage.setItem('aquaguard_full_baseline', fullBaselinePercent.toString());
+      } catch (e) {}
+    }
+  }
+
+  previousMotorRunning = isMotorRunning;
+
+  // Calculate ongoing cycle usage while motor is OFF
+  let currentCycleUsedLiters = 0.0;
+  if (!isMotorRunning && fullBaselinePercent !== null) {
+    if (currentPercent > fullBaselinePercent) {
+      // Water level rose without motor (manual top-up or positive sensor drift)
+      fullBaselinePercent = currentPercent;
+      try {
+        localStorage.setItem('aquaguard_full_baseline', fullBaselinePercent.toString());
+      } catch (e) {}
+    } else {
+      currentCycleUsedLiters = tankCapacityLiters * ((fullBaselinePercent - currentPercent) / 100.0);
+    }
+  }
+
+  const displayedUsage = Math.max(0, totalAccumulatedUsedLiters + currentCycleUsedLiters);
+
+  const usedEl = document.getElementById('usedDisplay');
+  if (usedEl) {
+    usedEl.innerText = displayedUsage.toFixed(1);
+  }
+
+  return displayedUsage;
+}
 
 /* ==========================================================================
    MOTOR CONTROLS & VISUALS
@@ -388,11 +475,11 @@ function updateMotorVisuals(isOn, mode) {
     modeBadge.innerText = (mode || 'AUTO').toUpperCase();
   }
 
-  // Animate water pouring into tank if pump is running
+  // Inflow water filling stream turns ON/OFF STRICTLY with motor state
   if (inflowStream) {
     if (isOn) {
       inflowStream.classList.add('flowing');
-    } else if (Math.abs(targetWaterPercent - currentWaterPercent) <= 0.1) {
+    } else {
       inflowStream.classList.remove('flowing');
     }
   }
@@ -403,10 +490,12 @@ function sendMotorCommand(action) {
   if (action === 'on') {
     payload = { command: 'MOTOR', value: 'ON', action: 'motor', state: 'on' };
     updateMotorVisuals(true, 'MANUAL');
+    updateWaterUsage(true, currentWaterPercent);
     showToast('Sent: Manual Motor ON', 'info');
   } else if (action === 'off') {
     payload = { command: 'MOTOR', value: 'OFF', action: 'motor', state: 'off' };
     updateMotorVisuals(false, 'MANUAL');
+    updateWaterUsage(false, currentWaterPercent);
     showToast('Sent: Manual Motor OFF', 'info');
   } else if (action === 'auto') {
     payload = { command: 'MODE', value: 'AUTO', action: 'motor', state: 'auto' };
@@ -637,9 +726,17 @@ function calibrate(type) {
 
 function resetUsage() {
   if (!confirm('Reset total cumulative water usage back to 0 Liters?')) return;
+  totalAccumulatedUsedLiters = 0.0;
+  fullBaselinePercent = currentWaterPercent;
+  try {
+    localStorage.setItem('aquaguard_accumulated_used', '0');
+    localStorage.setItem('aquaguard_full_baseline', fullBaselinePercent.toString());
+  } catch (e) {}
+  const usedEl = document.getElementById('usedDisplay');
+  if (usedEl) usedEl.innerText = '0.0';
   const payload = { command: 'RESET_USAGE', action: 'resetUsage' };
   if (sendCommand(payload)) {
-    showToast('Water usage reset sent', 'info');
+    showToast('Water usage reset to 0 L', 'info');
   }
 }
 
