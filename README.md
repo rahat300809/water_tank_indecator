@@ -42,11 +42,11 @@ A real-time, robust Smart Water Tank Controller and Monitoring System powered by
 
 | Parameter | Value |
 |---|---|
-| **Broker IP (Host)** | `192.168.110.133` |
+| **Broker IP (Host)** | `192.168.110.133` (VM) / `192.168.0.104` (Relay) |
 | **Port (TCP / ESP32)** | `1883` |
-| **Port (WebSocket / Web)**| `9001` (Proxied via Apache at `wss://www.rahat.eu.cc/mqtt`) |
-| **MQTT Username** | `rahat300809` |
-| **MQTT Password** | `RAHAT678` |
+| **Port (WebSocket / Web)**| `9001` (Proxied via Apache at `/mqtt`) |
+| **MQTT Username** | `<YOUR_MQTT_USERNAME>` |
+| **MQTT Password** | `<YOUR_MQTT_PASSWORD>` |
 | **Client ID (ESP32)** | `ESP32_WATER_01` |
 | **Telemetry Topic (Data)**| `devices/ESP32_WATER_01/telemetry` |
 | **Command Topic (Control)**| `devices/ESP32_WATER_01/command` |
@@ -111,6 +111,8 @@ water_tank_indecator/
 │   ├── style.css                     # Premium styling with smooth transitions & responsive grid
 │   ├── app.js                        # MQTT WebSocket real-time engine & fluid tank animation
 │   └── mqtt.min.js                   # Local MQTT.js bundle for zero-external-dependency offline support
+├── mqtt_proxy.py                     # Dual TCP (1883) & WebSocket (9001) relay for VMware NAT
+├── start_proxy.bat                   # 1-click launcher for the MQTT relay on Windows
 ├── README.md                         # Documentation
 └── .gitignore                        # Git ignore rules
 ```
@@ -126,8 +128,8 @@ water_tank_indecator/
 3. Open `ESP32_Water_Controller/ESP32_Water_Controller.ino`.
 4. Verify your WiFi credentials:
    ```cpp
-   const char* WIFI_SSID = "IoT Lab";
-   const char* WIFI_PASS = "iot@diu123";
+   const char* WIFI_SSID = "YOUR_WIFI_SSID";
+   const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
    ```
 5. Select your ESP32 board (e.g. `ESP32 Dev Module`) and COM Port.
 6. Click **Upload**.

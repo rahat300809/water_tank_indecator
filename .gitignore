@@ -14,3 +14,7 @@ build/
 # IDE files
 .vscode/
 .idea/
+
+# Private Credentials & Secrets
+CREDENTIALS.md
+*.secrets
