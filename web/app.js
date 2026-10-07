@@ -16,8 +16,10 @@ let motorOffPercent = 75.0;// %
 let settingsChanged = false;
 
 // --- DAMPING & STATISTICAL BUFFER STATE ---
-const WINDOW_MS = 6000;    // 6-second rolling analysis window
-let sampleHistory = [];    // [{ timestamp, percent, dist, level }]
+const WINDOW_MS = 5000;          // 5-second rolling analysis window
+const EVAL_INTERVAL_MS = 5000;   // Evaluate and commit target every 5 seconds
+let sampleHistory = [];          // [{ timestamp, percent, dist, level }]
+let lastEvalTime = 0;            // Timestamp of last 5-second evaluation
 let isDampingEnabled = true;
 
 // Load damping preference
@@ -192,6 +194,31 @@ function sendCommand(cmdObj) {
    ANTI-SPIKE STATISTICAL FILTER & TELEMETRY PROCESSOR
    ========================================================================== */
 
+function evaluateRollingWindow(now) {
+  lastEvalTime = now;
+  if (sampleHistory.length === 0) return;
+
+  // Filter samples within the last 5-second window
+  const recentSamples = sampleHistory.filter(s => s.timestamp >= now - WINDOW_MS);
+  const pool = recentSamples.length >= 2 ? recentSamples : sampleHistory;
+
+  // Extract water percentages
+  const percentages = pool.map(s => s.percent);
+
+  // 1. Sort values to find the median
+  percentages.sort((a, b) => a - b);
+  const mid = Math.floor(percentages.length / 2);
+  const median = percentages.length % 2 !== 0 ? percentages[mid] : (percentages[mid - 1] + percentages[mid]) / 2;
+
+  // 2. Reject outliers: keep values within +/- 10% of median (filter sensor spikes)
+  const cluster = percentages.filter(val => Math.abs(val - median) <= 10.0);
+  const robustCluster = cluster.length > 0 ? cluster : percentages;
+
+  // 3. Dominant cluster average
+  const clusterMean = robustCluster.reduce((sum, v) => sum + v, 0) / robustCluster.length;
+  targetWaterPercent = clusterMean;
+}
+
 function processIncomingTelemetry(d) {
   const now = Date.now();
 
@@ -199,6 +226,14 @@ function processIncomingTelemetry(d) {
   const rawPercent = d.percent !== undefined ? parseFloat(d.percent) : (d.water_percent !== undefined ? parseFloat(d.water_percent) : 0);
   const rawDist = d.distance !== undefined ? parseFloat(d.distance) : (d.raw_distance !== undefined ? parseFloat(d.raw_distance) : 0);
   const rawLevel = d.level !== undefined ? parseFloat(d.level) : (d.water_level !== undefined ? parseFloat(d.water_level) : 0);
+
+  // First packet init: instant setup without waiting 5 seconds on first page load
+  if (isFirstPacket) {
+    targetWaterPercent = rawPercent;
+    currentWaterPercent = rawPercent;
+    lastEvalTime = now;
+    isFirstPacket = false;
+  }
 
   // Store into rolling statistical window
   sampleHistory.push({
@@ -208,33 +243,19 @@ function processIncomingTelemetry(d) {
     level: rawLevel
   });
 
-  // Prune points older than WINDOW_MS
-  sampleHistory = sampleHistory.filter(s => s.timestamp >= now - WINDOW_MS);
+  // Prune points older than WINDOW_MS + 2000
+  sampleHistory = sampleHistory.filter(s => s.timestamp >= now - (WINDOW_MS + 2000));
 
   // Determine target water percentage
-  if (isDampingEnabled) {
-    // 1. OUTLIER REJECTION & DOMINANT CLUSTER MEAN
-    const sorted = sampleHistory.map(s => s.percent).sort((a, b) => a - b);
-    const mid = Math.floor(sorted.length / 2);
-    const median = sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-
-    // Tolerance band: Keep samples within +/- 12% of median (reject sudden 1-sample spikes)
-    const cluster = sorted.filter(val => Math.abs(val - median) <= 12.0);
-    const robustCluster = cluster.length > 0 ? cluster : sorted;
-    
-    // Average of the dominant cluster
-    const clusterMean = robustCluster.reduce((sum, v) => sum + v, 0) / robustCluster.length;
-    targetWaterPercent = clusterMean;
-  } else {
+  if (!isDampingEnabled) {
     // Raw live feed: instant 1:1
     targetWaterPercent = rawPercent;
     currentWaterPercent = rawPercent; // instantaneous jump if damping disabled
-  }
-
-  // First packet init
-  if (isFirstPacket) {
-    currentWaterPercent = targetWaterPercent;
-    isFirstPacket = false;
+  } else {
+    // 5-second evaluation interval: only re-evaluate target every 5 seconds!
+    if (now - lastEvalTime >= EVAL_INTERVAL_MS) {
+      evaluateRollingWindow(now);
+    }
   }
 
   // Update Tank Dimensions (if sent from controller & user not editing)
@@ -298,13 +319,33 @@ function processIncomingTelemetry(d) {
    ========================================================================== */
 
 function fluidLoop() {
-  // Smoothly interpolate currentWaterPercent towards targetWaterPercent
+  const now = Date.now();
+
+  // If damping is enabled and 5-second interval has elapsed, evaluate rolling window
+  if (isDampingEnabled && (now - lastEvalTime >= EVAL_INTERVAL_MS)) {
+    evaluateRollingWindow(now);
+  }
+
+  // Smooth, slow fluid slide towards targetWaterPercent
   if (isDampingEnabled) {
     const diff = targetWaterPercent - currentWaterPercent;
-    if (Math.abs(diff) > 0.05) {
-      // Gentle spring ease: faster for large jumps, gentle for small ripples
-      const rate = Math.abs(diff) > 20 ? 0.04 : (Math.abs(diff) > 5 ? 0.03 : 0.02);
-      currentWaterPercent += diff * rate;
+    if (Math.abs(diff) > 0.02) {
+      // Slow, relaxing fluid sliding motion (approx 8-10% per second for full transitions)
+      const maxSpeed = 0.16;  // max 0.16% per frame => ~9.6% per second at 60 FPS
+      const minSpeed = 0.015; // gentle landing speed near target
+      let step = diff * 0.012; // slow easing coefficient
+
+      if (Math.abs(step) > maxSpeed) {
+        step = Math.sign(diff) * maxSpeed;
+      } else if (Math.abs(step) < minSpeed) {
+        step = Math.sign(diff) * minSpeed;
+      }
+
+      if (Math.abs(step) >= Math.abs(diff)) {
+        currentWaterPercent = targetWaterPercent;
+      } else {
+        currentWaterPercent += step;
+      }
     } else {
       currentWaterPercent = targetWaterPercent;
     }
@@ -343,7 +384,6 @@ function fluidLoop() {
   updateWaterUsage(isMotorActive, currentWaterPercent);
 
   // Update Trend Badge every 2 seconds
-  const now = Date.now();
   if (now - lastTrendCheckTime >= 2000) {
     lastTrendCheckTime = now;
     const delta = currentWaterPercent - previousWaterPercent;

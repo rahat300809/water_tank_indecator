@@ -472,7 +472,7 @@ body {
   right: 0;
   height: 0%;
   background: linear-gradient(180deg, var(--water-surface) 0%, var(--water-deep) 45%, var(--water-bottom) 100%);
-  transition: height 0.05s linear;
+  transition: none; /* Driven 60 FPS smoothly by client fluidLoop engine */
   overflow: hidden;
   box-shadow: 0 0 20px rgba(2, 132, 199, 0.5);
 }
