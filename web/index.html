@@ -154,6 +154,9 @@
           <strong id="litersCalculated">0.0</strong>
           <span class="capacity-total">/ <span id="capacityTotal">785.4</span> L</span>
         </div>
+        <div class="height-comparison-tag">
+          MQTT Raw: <strong id="rawHeightMini">0.0</strong> cm
+        </div>
       </div>
     </div>
 
@@ -226,26 +229,48 @@
     </div>
   </section>
 
-  <!-- KEY METRICS ROW -->
+  <!-- KEY METRICS: 2x2 HIGH-CONTRAST GRID -->
   <section class="metrics-row">
+    <!-- Filtered Depth -->
     <div class="metric-card">
-      <span class="metric-label">Water Depth</span>
+      <div class="metric-header-tag">
+        <span class="metric-label">Filtered Depth</span>
+        <span class="tag-pill smooth">Filtered</span>
+      </div>
       <div class="metric-val">
         <strong id="levelDisplay">0.0</strong>
         <span class="unit">cm</span>
       </div>
     </div>
 
+    <!-- Raw Height (MQTT Direct) -->
+    <div class="metric-card raw-card" title="Direct raw height value from MQTT without client-side smoothing">
+      <div class="metric-header-tag">
+        <span class="metric-label">Raw Height</span>
+        <span class="tag-pill raw">MQTT Raw</span>
+      </div>
+      <div class="metric-val">
+        <strong id="rawHeightDisplay" class="raw-value">0.0</strong>
+        <span class="unit">cm</span>
+      </div>
+    </div>
+
+    <!-- Sensor Distance -->
     <div class="metric-card">
-      <span class="metric-label">Sensor Distance</span>
+      <div class="metric-header-tag">
+        <span class="metric-label">Sensor Dist</span>
+      </div>
       <div class="metric-val">
         <strong id="distDisplay">0.0</strong>
         <span class="unit">cm</span>
       </div>
     </div>
 
+    <!-- Total Water Used -->
     <div class="metric-card">
-      <span class="metric-label">Total Water Used</span>
+      <div class="metric-header-tag">
+        <span class="metric-label">Total Used</span>
+      </div>
       <div class="metric-val">
         <strong id="usedDisplay">0.0</strong>
         <span class="unit">L</span>

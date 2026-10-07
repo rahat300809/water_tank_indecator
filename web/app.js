@@ -254,6 +254,17 @@ function processIncomingTelemetry(d) {
   const distEl = document.getElementById('distDisplay');
   if (distEl) distEl.innerText = rawDist.toFixed(1);
 
+  // Live Raw Height directly from MQTT (untouched by smoothing or damping)
+  const rawHeightEl = document.getElementById('rawHeightDisplay');
+  if (rawHeightEl) {
+    rawHeightEl.innerText = rawLevel.toFixed(1);
+    rawHeightEl.classList.add('flash-pulse');
+    setTimeout(() => rawHeightEl.classList.remove('flash-pulse'), 250);
+  }
+
+  const rawMiniEl = document.getElementById('rawHeightMini');
+  if (rawMiniEl) rawMiniEl.innerText = rawLevel.toFixed(1);
+
   const usedEl = document.getElementById('usedDisplay');
   const usedVal = d.used !== undefined ? d.used : d.water_used;
   if (usedEl && usedVal !== undefined) usedEl.innerText = Number(usedVal).toFixed(1);
